@@ -21,7 +21,9 @@ dependencies = [
     { name = "natsort" },
     { name = "numpy" },
     { name = "pandas" },
+    { name = "pybaselines" },
     { name = "pyfai", extra = ["gui"] },
+    { name = "scipy" },
     { name = "tqdm" },
     { name = "xarray" },
 ]
@@ -39,7 +41,9 @@ requires-dist = [
     { name = "natsort", specifier = ">=8.4.0" },
     { name = "numpy", specifier = ">=2.4.1" },
     { name = "pandas", specifier = ">=3.0.0" },
+    { name = "pybaselines", specifier = ">=1.2.1" },
     { name = "pyfai", extras = ["gui"], specifier = ">=2025.12.1" },
+    { name = "scipy", specifier = ">=1.17.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "xarray", specifier = ">=2026.1.0" },
 ]
@@ -988,6 +992,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cd/05/0a34433a064256a578f1783a10da6df098ceaa4a57bbeaa96a6c0352786b/pure_eval-0.2.3.tar.gz", hash = "sha256:5f4e983f40564c576c7c8635ae88db5956bb2229d7e9237d03b3c0b0190eaf42", size = 19752 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8e/37/efad0257dc6e593a18957422533ff0f87ede7c9c6ea010a2177d738fb82f/pure_eval-0.2.3-py3-none-any.whl", hash = "sha256:1db8e35b67b3d218d818ae653e27f06c3aa420901fa7b081ca98cbedc874e0d0", size = 11842 },
+]
+
+[[package]]
+name = "pybaselines"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7b/45/60ed7d059023b45eb45a4279356379d13ef883b7efd1c48242e0c1a30d3a/pybaselines-1.2.1.tar.gz", hash = "sha256:5cae63e00cc9f469e446d05e64c731b87a54dbfd9b70ef049e46cf80fc91ad1a", size = 340155 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3d/66/f044d53935b142d47ce2a65b8c4f51fdb5ca85ee1035fb2b7857971b122e/pybaselines-1.2.1-py3-none-any.whl", hash = "sha256:d8f224a0b5ac4cdcef861bc60533131c37255b4d1193f18a410bc37fe5217c73", size = 211891 },
 ]
 
 [[package]]
