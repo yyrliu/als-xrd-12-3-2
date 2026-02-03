@@ -289,7 +289,7 @@ def process_time_series(time_series_da: xr.DataArray,
     if debug:
         logger.info(f"Processing {len(times)} time steps...")
 
-    for t in times:
+    for i, t in enumerate(times):
         try:
             da_t = time_series_da.sel(time=t, method='nearest')
             
@@ -315,7 +315,7 @@ def process_time_series(time_series_da: xr.DataArray,
                     
                     peak_x = peaks_x[np.argmax(intensity)]
                     no_slope = peak_pos > slope_threshold 
-                    _, popt = voigt_fit(corrected_t, x="twoTheta_deg", peak_pos=peak_x, window_size=window_size, no_slope=no_slope)
+                    _, popt = voigt_fit(corrected_t, x="twoTheta_deg", peak_pos=peak_x, window_size=window_size*2, no_slope=no_slope)
                     
                     if popt[0] < 0.01:
                         continue
@@ -350,7 +350,7 @@ def process_time_series(time_series_da: xr.DataArray,
                          shift_warnings.append(msg)
                          large_shifts.append(msg)
 
-                if visualize_step:
+                if visualize_step or i % 10 == 0:
                     if not viz_dir_created:
                          viz_dir.mkdir(parents=True, exist_ok=True)
                          viz_dir_created = True
@@ -393,7 +393,7 @@ def process_time_series(time_series_da: xr.DataArray,
                         ax.axvline(r, linestyle=':', color=color, alpha=0.5)
 
                     ax.set_title(f"Shift Detected at t={t}s")
-                    ax.set_ylim(None, 0.2)
+                    ax.set_yscale('log')
                     
                     # Save plot
                     plot_path = viz_dir / f"shift_t_{t:.2f}s.png"
