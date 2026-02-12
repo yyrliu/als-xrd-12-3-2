@@ -75,35 +75,66 @@ def find_peaks_in_window(da: xr.DataArray, x: str, target=None, window_size=None
 
     return peaks_x, peaks_intensities, properties
 
-def voigt_fit(da: xr.DataArray, x: str, peak_pos: float, window_size: float, no_slope=True):
+def voigt_fit(da: xr.DataArray, x: str, initial_guess: (float|list), window_size: float, no_slope=True, bounds=None):
     """
     Fit a Voigt profile to a peak in the DataArray.
+    initial_guess could be peak_pos, or a list of parameters [amp, cen, sigma, gamma, slope, offset] (slope and offset optional if no_slope=True).
+    bounds: tuple of (min, max) arrays for curve_fit. If None, defaults are used.
     """
     # set bounds for parameters: amp > 0, sigma > 0, gamma > 0
     # amp, cen, sigma, gamma, slope, offset
-    if no_slope:
-        bounds = (
-            [0, peak_pos - 0.5, 0, 0, -1e-9, -np.inf], 
-            [np.inf, peak_pos + 0.5, np.inf, np.inf, 1e-9, np.inf]
-        )
+
+    if isinstance(initial_guess, float):
+        peak_pos = initial_guess
+        peak_intensity = da.sel(**{x: peak_pos}, method='nearest').values
+        
+        # Handle case where peak intensity itself is NaN/Inf
+        if not np.isfinite(peak_intensity):
+            peak_intensity = 0.001 # safe fallback
+
+        # guess: amp, cen, sigma, gamma, slope, offset, offset is set later after fit_da is generated
+        initial_guess = [np.clip(peak_intensity, 1e-6, None), peak_pos, 0.1, 0.1, 0, None]
+    elif isinstance(initial_guess, list) and len(initial_guess) >= 4:
+        # If passed a list, we assume it's a good guess, but we need peak_pos for window/bounds defaults
+        peak_pos = initial_guess[1]
     else:
-        bounds = (
-            [0, peak_pos - 0.5, 0, 0, -np.inf, -np.inf], 
-            [np.inf, peak_pos + 0.5, np.inf, np.inf, np.inf, np.inf]
-        )
+        raise ValueError("initial_guess must be either a float (peak position) or a list of parameters with at least 4 elements (amp, cen, sigma, gamma).")
 
-    peak_intensity = da.sel(**{x: peak_pos}, method='nearest').values
+    if bounds is None:
+        if no_slope:
+            bounds = (
+                [0, peak_pos - 0.5, 0, 0, -1e-9, -np.inf], 
+                [np.inf, peak_pos + 0.5, np.inf, np.inf, 1e-9, np.inf]
+            )
+        else:
+            bounds = (
+                [0, peak_pos - 0.5, 0, 0, -np.inf, -np.inf], 
+                [np.inf, peak_pos + 0.5, np.inf, np.inf, np.inf, np.inf]
+            )
+
     fit_da = da.sel(**{x: slice(peak_pos - window_size / 2, peak_pos + window_size / 2)})
-    x_data = fit_da[x].values
-    y_data = fit_da.values
+    
+    # Ensure we use only finite data for fitting
+    # xarray's dropna usually handles NaNs, but we also want to exclude infs
+    x_vals = fit_da[x].values
+    y_vals = fit_da.values
+    
+    mask = np.isfinite(y_vals)
+    x_data = x_vals[mask]
+    y_data = y_vals[mask]
+    
+    if len(y_data) < 4: # Need at least as many points as parameters (roughly)
+         raise RuntimeError(f"Not enough valid data points in fitting window for peak at {peak_pos:.2f}° (found {len(y_data)}).")
 
-    # guess: amp, cen, sigma, gamma, slope, offset
-    initial_guess = [peak_intensity, peak_pos, 0.1, 0.1, 0, np.min(y_data)]
+    # If offset is not provided, set it to the minimum of the y_data in the fitting window
+    if initial_guess[5] is None:
+        initial_guess[5] = np.min(y_data)
+
     try:
         popt, pcov = curve_fit(voigt_profile_func, x_data, y_data, p0=initial_guess, bounds=bounds)
     except RuntimeError as e:
-         logger.error(f"Voigt fit failed for peak at {peak_pos:.2f}: {e}")
-         raise
+        logger.error(f"Voigt fit failed for peak at {peak_pos:.2f}: {e}")
+        raise
 
     fitted_curve = voigt_profile_func(da[x].values, *popt)
     fitted_da = xr.DataArray(fitted_curve, coords=da.coords, dims=da.dims)
@@ -222,7 +253,21 @@ def calculate_peak_areas(da: xr.DataArray, x: str, fit_results: list, confidence
         if subset.sizes[x] > 1:
             background = slope * (subset[x] - cen) + offset
             corrected_subset = subset - background
-            area = corrected_subset.integrate(coord=x).item()
+            # Handle NaN in integration by filling. Or should we warn?
+            # Integration with NaNs returns NaN.
+            if np.isnan(corrected_subset).any():
+                # Interpolate over NaNs or just fill with 0?
+                # Filling with 0 (after bg correction) assumes no intensity where NaN is.
+                # But corrected_subset = subset - background. If subset is NaN, corrected is NaN.
+                # If we fill subset with 0, we might get negative peaks if background is > 0.
+                # Better to interpolate subset.
+                subset = subset.interpolate_na(dim=x, method='linear', fill_value="extrapolate")
+                corrected_subset = subset - background
+            
+            try:
+                area = corrected_subset.integrate(coord=x).item()
+            except:
+                 area = np.nan
         else:
             area = 0.0
 
@@ -305,10 +350,10 @@ def process_time_series(time_series_da: xr.DataArray,
                     peaks_x, intensity, _ = find_peaks_in_window(
                         corrected_t,
                         x="twoTheta_deg",
-                        target=peak_pos,
+                        initial_guess=peak_pos,
                         window_size=window_size,
-                        height=0.01,
-                        prominence=0.01
+                        height=0.001,
+                        # prominence=0.01
                     )
                     if len(peaks_x) == 0:
                         continue
@@ -394,6 +439,12 @@ def process_time_series(time_series_da: xr.DataArray,
 
                     ax.set_title(f"Shift Detected at t={t}s")
                     ax.set_yscale('log')
+                    # add large_shifts msg as text box
+                    if large_shifts:
+                        textstr = "\n".join(large_shifts)
+                        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+                        ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=10,
+                                verticalalignment='top', bbox=props)
                     
                     # Save plot
                     plot_path = viz_dir / f"shift_t_{t:.2f}s.png"
@@ -415,3 +466,200 @@ def process_time_series(time_series_da: xr.DataArray,
         df_evolution = pd.DataFrame()
 
     return df_evolution, shift_warnings
+
+
+def process_time_series_by_peak(
+    time_series_da: xr.DataArray,
+    peaks_definition: list,
+    sample_name: str,
+    output_dir: str,
+    debug: bool = False,
+    **baseline_kwargs
+) -> pd.DataFrame:
+    """
+    Process time series data peak-by-peak with bi-directional tracking.
+    
+    Parameters:
+    peaks_definition : list of tuples
+        Format: [(target_pos, window_size, (start_idx, end_idx), peak_name), ...]
+        start_idx: Index to start tracking from.
+        end_idx: Index to end at (inclusive). 
+                 If start < end, tracks forward. If start > end, tracks backward.
+    """
+    times = time_series_da.time.values
+    num_times = len(times)
+    
+    exp_peak_results = []
+    
+    # Prepare viz directory
+    viz_dir = pathlib.Path(output_dir) / sample_name / "peak_tracking_viz"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    
+    for (peak_target, window_size, (start_idx, end_idx), peak_name) in peaks_definition:
+        if debug:
+            logger.info(f"Tracking Peak '{peak_name}' ({start_idx} -> {end_idx})...")
+
+        # Handle negative indices
+        if start_idx < 0: start_idx += num_times
+        if end_idx < 0: end_idx += num_times
+        
+        # Determine Direction and Range
+        step = 1 if end_idx >= start_idx else -1
+        
+        # Generate indices to process (inclusive of end_idx)
+        # Python range stop is exclusive, so we add step
+        processing_indices = range(start_idx, end_idx + step, step)
+        
+        peak_lost = True
+        last_popt = None
+        last_ref_time = None
+        first_peak_found = False
+        
+        for t_idx in processing_indices:
+            if t_idx < 0 or t_idx >= num_times: continue
+            
+            t = times[t_idx]
+            da_t = time_series_da.sel(time=t, method='nearest')
+            
+            # Use raw data (baseline correction handled inside if needed, assuming user passes kwargs)
+            if baseline_kwargs.get('method'):
+                 da_t, _ = baseline_correction(da_t, **baseline_kwargs)
+
+            fit_success = False
+            current_popt = None
+            
+            # --- Phase: TRACK (Optimization) ---
+            # Try to track if we have a previous fix
+            if not peak_lost:
+                popt_arr = np.array(last_popt)
+                tolerance = 0.2
+                
+                # Bounds: +/- 20%, but enforce a minimum absolute breathing room of 0.001
+                # This prevents "pincering" parameters that are near zero (like gamma/sigma/slope)
+                delta = np.maximum(np.abs(popt_arr) * tolerance, 1e-3)
+                
+                lower_bounds = popt_arr - delta
+                upper_bounds = popt_arr + delta
+                
+                # Physical Constraints
+                # [amp, cen, sigma, gamma, slope, offset]
+                lower_bounds[0] = max(0, lower_bounds[0])       # amp > 0
+                lower_bounds[2] = max(1e-6, lower_bounds[2])    # sigma > 0
+                lower_bounds[3] = max(1e-6, lower_bounds[3])    # gamma > 0
+                
+                # Ensure initial_guess is within bounds to avoid ValueError in curve_fit
+                initial_guess_clamped = np.clip(last_popt, lower_bounds, upper_bounds).tolist()
+                
+                try:
+                    _, popt = voigt_fit(
+                        da_t, x="twoTheta_deg",
+                        initial_guess=initial_guess_clamped,
+                        window_size=window_size * 1.5,
+                        bounds=(lower_bounds, upper_bounds)
+                    )
+                    current_popt = popt
+                    fit_success = True
+                except (RuntimeError, ValueError) as e:
+                    fit_success = False
+                    peak_lost = True 
+                    if debug: 
+                        logger.info(f"  Tracking lost at t={t:.1f}s (Error: {e}). Switching to search.")
+
+            # --- Phase: SEARCH (Discovery) ---
+            # If peak is lost (or tracking failed just now), we search
+            if peak_lost:
+                peaks_x, intensity, _ = find_peaks_in_window(
+                    da_t, x="twoTheta_deg", 
+                    target=peak_target, window_size=window_size, 
+                    height=0.001
+                )
+                
+                if len(peaks_x) > 0:
+                    best_idx = np.argmax(intensity)
+                    peak_pos_guess = peaks_x[best_idx]
+                    
+                    try:
+                        no_slope = peak_pos_guess > 10.0
+                        _, popt = voigt_fit(
+                            da_t, x="twoTheta_deg", 
+                            initial_guess=peak_pos_guess, 
+                            window_size=window_size * 1.5, 
+                            no_slope=no_slope
+                        )
+                        current_popt = popt
+                        fit_success = True
+                        
+                    except RuntimeError:
+                        pass
+
+            # --- Visualization (Found / Refound) ---
+            if fit_success and (peak_lost or not first_peak_found):
+                try:
+                    popt = current_popt # Ensure we use the current fit
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    plot_min, plot_max = peak_target - window_size, peak_target + window_size
+                    da_t.sel(twoTheta_deg=slice(plot_min, plot_max)).plot(ax=ax, label='Data')
+                    fit_x = np.linspace(plot_min, plot_max, 100)
+                    ax.plot(fit_x, voigt_profile_func(fit_x, *popt), 'r--', label='Fit')
+                    
+                    # add the fitting parameters as text
+                    param_text = f"Amp: {popt[0]:.4f}\nCen: {popt[1]:.4f}\nSigma: {popt[2]:.3f}\nGamma: {popt[3]:.3f}"
+                    if len(popt) == 6:
+                        param_text += f"\nSlope: {popt[4]:.4f}\nOffset: {popt[5]:.4f}"
+                    ax.text(0.05, 0.95, param_text, transform=ax.transAxes, fontsize=10,
+                            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    
+                    status_text = "Refound" if peak_lost and first_peak_found else "Found"
+                    ax.set_title(f"'{peak_name}' {status_text} at t={t:.1f}s (idx {t_idx})")
+                    fig.savefig(viz_dir / f"{peak_name}_{status_text.lower()}_idx{t_idx}.png")
+                    plt.close(fig)
+                    
+                    first_peak_found = True
+                except Exception as e:
+                    if debug: logger.warning(f"Visualization failed: {e}")
+
+            # --- Capture Result ---
+            if fit_success:
+                try:
+                    fit_result_obj = {'popt': current_popt}
+                    final_res = calculate_peak_areas(da_t, "twoTheta_deg", [fit_result_obj], confidence=0.95)[0]
+                    
+                    ref_val = last_ref_time if not peak_lost else "Search"
+                    
+                    if debug: logger.info(f"Captured peak '{peak_name}' at t={t:.1f}, Area={final_res['area']:.4f}")
+
+                    exp_peak_results.append({
+                        'Time': t,
+                        'PeakName': peak_name,
+                        'Position': final_res['popt'][1],
+                        'Area': final_res['area'],
+                        'RefTime': ref_val
+                    })
+                    
+                    peak_lost = False
+                    last_popt = current_popt
+                    last_ref_time = t
+                except Exception as e:
+                    msg = f"Failed to capture result at t={t}: {e}"
+                    logger.error(msg)
+                    peak_lost = True 
+            else:
+                peak_lost = True
+                last_popt = None
+
+    # Format Output
+    if debug: logger.info(f"Total results captured: {len(exp_peak_results)}")
+    
+    if exp_peak_results:
+        df_raw = pd.DataFrame(exp_peak_results)
+        # Check if 'Area' is all NaN or something?
+        if debug: 
+             logger.info("\n--- Raw Results Preview ---")
+             logger.info(df_raw.head())
+             logger.info(f"Unique Peaks: {df_raw['PeakName'].unique()}")
+             
+        df_pivot = df_raw.pivot_table(index='Time', columns='PeakName', values='Area')
+        return df_pivot
+    else:
+        if debug: logger.warning("No results collected for this experiment.")
+        return pd.DataFrame()
