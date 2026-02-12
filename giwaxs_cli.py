@@ -220,11 +220,14 @@ def main():
     poni_file = ""
     calibrant_file = ""
 
-    # Find PONI file
+    # Find PONI file first in dir then parent dir
     try:
-        poni_file = next(exp_dir.parent.glob("*.poni"))
+        poni_file = next(exp_dir.glob("*.poni"))
     except StopIteration:
-         raise FileNotFoundError("PONI file not found in parent directory.")
+        try:
+            poni_file = next(exp_dir.parent.glob("*.poni"))
+        except StopIteration:
+            raise FileNotFoundError("PONI file not found in parent directory.")
 
     # Find Calibrant file
     calibrant_file = Path(exp_dir.parents[1], "ito_calibrant.D")
@@ -238,8 +241,14 @@ def main():
     first_image = frame_files[0]
     
     # 1. Refine Geometry
-    refined_poni_path, sg = refine_geometry(first_image, calibrant_file, poni_file)
-    refined_poni = Path(refined_poni_path)
+    # If poni file is in the same dir as images, skip refinement
+    if poni_file.parent == exp_dir:
+        print(f"PONI file found in experiment directory; skipping refinement.")
+        refined_poni = poni_file
+        sg = None
+    else:
+        refined_poni_path, sg = refine_geometry(first_image, calibrant_file, poni_file)
+        refined_poni = Path(refined_poni_path)
 
     # 2. Process Frames
     data_array = process_frames(frame_files, str(refined_poni))
