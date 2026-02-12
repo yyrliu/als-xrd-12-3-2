@@ -1,0 +1,14 @@
+# Nota: C-Order, 1 refers to the Y axis, 2 to the X axis
+# Calibration done on Mon Jan 26 13:41:55 2026
+poni_version: 2.1
+Detector: Pilatus1M
+Detector_config: {"pixel1": 0.000172, "pixel2": 0.000172, "orientation": 3, "sensor": {"material": "Si", "thickness": 0.000320}}
+Distance: 0.18570449043375192
+Poni1: 0.09092180466203595
+Poni2: 0.05320196660220933
+Rot1: -0.5945251040323765
+Rot2: 0.0
+Rot3: 3.1415899998480463
+Wavelength: 1.2398419843320025e-10
+# Calibrant: ito_calibrant
+# Image: fabio:///G:/Shared drives/Sutter-Fella Lab/ECRP-Project/results/beamtime_Dec2025/yiru_insitu_Dec2025/insitu_1p0M_ClMBAI_6re/insitu_1p0M_ClMBAI_6re_00001.tif

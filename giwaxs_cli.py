@@ -33,7 +33,7 @@ def process_frame(frame_file, ai, radial_range=None, azimuth_range=None):
     frame = fabio.open(str(frame_file)).data
     res = ai.integrate1d(
         frame,
-        npt=500,
+        npt=2000,
         radial_range=radial_range,
         azimuth_range=azimuth_range,
         unit="q_A^-1",
@@ -214,6 +214,9 @@ def create_plots(exp_dir, frame_files, first_image, refined_poni, data_array, nc
 def main():
     parser = argparse.ArgumentParser(description="Process GIWAXS experiment data.")
     parser.add_argument("exp_dir", type=str, help="Experiment directory path")
+    parser.add_argument("--num_workers", type=int, default=None, help="Number of parallel workers (default: all cores minus one)")
+    parser.add_argument("--save_csv", action="store_true", help="Whether to save integrated data as CSV in addition to NetCDF")
+    parser.add_argument("--output_dir", type=str, default='./results', help="Directory to save outputs (default: ./results)")
     args = parser.parse_args()
 
     exp_dir = Path(args.exp_dir)
@@ -227,7 +230,10 @@ def main():
         try:
             poni_file = next(exp_dir.parent.glob("*.poni"))
         except StopIteration:
-            raise FileNotFoundError("PONI file not found in parent directory.")
+            print(f"No PONI file found in {exp_dir} or its parent directory. Using default geometry parameters.")
+            poni_file = Path('./default_geometry.poni')
+            if not poni_file.is_file():
+                raise FileNotFoundError("Default PONI file not found at './default_geometry.poni'. Please provide a PONI file in the experiment directory or its parent directory.")
 
     # Find Calibrant file
     calibrant_file = Path(exp_dir.parents[1], "ito_calibrant.D")
@@ -251,6 +257,7 @@ def main():
         refined_poni = Path(refined_poni_path)
 
     # 2. Process Frames
+    print(f"Processing {len(frame_files)} frames with {args.num_workers or 'all available'} workers...")
     data_array = process_frames(frame_files, str(refined_poni))
     print(f"Processed {len(frame_files)} frames.")
     print(f"DataArray shape: {data_array.shape}, q range: {data_array.coords['q_A^-1'].values[0]} to {data_array.coords['q_A^-1'].values[-1]}")
@@ -266,16 +273,39 @@ def main():
     # Using parent folder of exp_dir as typical default or the exp_dir itself? 
     # The notebook saved to: G:\Shared drives\Sutter-Fella Lab\ECRP-Project\results\beamtime_Dec2025
     # which is exp_dir.parent
-    save_dir = exp_dir.parents[1]
+
+    if args.output_dir:
+        if not Path(args.output_dir).is_absolute():
+            save_dir = exp_dir.parent / args.output_dir
+        else:
+            save_dir = Path(args.output_dir)
+    else:
+        save_dir = exp_dir.parent
+
+    if not save_dir.exists():
+        save_dir.mkdir(parents=True)
+        print(f"Created output directory at {save_dir}")
+
     nc_file_path = save_dir / f"{exp_dir.stem}.nc"
     if nc_file_path.is_file():
         nc_file_path.unlink()
         # double check deletion
         if nc_file_path.is_file():
             raise FileExistsError(f"Could not delete existing NetCDF file at {nc_file_path}")
-    
+        
     data_array.to_netcdf(nc_file_path)
     print(f"Saved NetCDF to {nc_file_path}")
+        
+    # save as csv for quick access (optional)
+    if args.save_csv:
+        csv_file_path = nc_file_path.with_suffix('.csv')
+        with open(csv_file_path, 'w') as f:
+            # write metadata as comments
+            for key, value in data_array.attrs.items():
+                f.write(f"# {key}: {value}\n")
+
+        data_array.to_pandas().to_csv(csv_file_path, mode='a')
+        print(f"Saved CSV to {csv_file_path}")
 
     # 4. Create Plots
     create_plots(exp_dir, frame_files, first_image, refined_poni, data_array, nc_file_path, sg=sg)
