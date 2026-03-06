@@ -64,11 +64,16 @@ def find_peaks_in_window(da: xr.DataArray, x: str, target=None, window_size=None
         da = target_da 
     
     peaks_indices, properties = find_peaks(da.values, **find_peaks_kwargs)
+    half_widths = peak_widths(da.values, peaks_indices, rel_height=0.5)
 
     # convert indices back to original x values (wavelength or twoTheta)
     peaks_x = da[x].values[peaks_indices]
     # get intensities at peak positions
     peaks_intensities = da.values[peaks_indices]
+    # convert from indices to x units
+    half_widths = half_widths[0] * np.abs(da[x].values[1] - da[x].values[0]) 
+    # add half widths to properties
+    properties['half_widths'] = half_widths
 
     # Convert properties from dict of arrays to array of dicts
     properties = [dict(zip(properties,t)) for t in zip(*properties.values())]
@@ -141,17 +146,24 @@ def voigt_fit(da: xr.DataArray, x: str, initial_guess: (float|list), window_size
 
     return fitted_da, popt
 
+def calculate_fwhm(sigma, gamma):
+    """
+    Calculate the Full Width at Half Maximum (FWHM) of a Voigt profile given its Gaussian (sigma) and Lorentzian (gamma) parameters.
+    """
+    fwhm_L = 2 * gamma
+    fwhm_G = 2.3548 * sigma
+    fwhm = 0.5346 * fwhm_L + np.sqrt(0.2166 * fwhm_L**2 + fwhm_G**2)
+    return fwhm
+
 def get_confidence_bounds(amp, cen, sigma, gamma, confidence=0.95, cut_off=2):
     """
     Calculate the x-values that bound `confidence` (fraction) of the Voigt profile area.
     """
     # Estimate FWHM to define a sufficient grid
-    fwhm_L = 2 * gamma
-    fwhm_G = 2.3548 * sigma
-    fwhm = 0.5346 * fwhm_L + np.sqrt(0.2166 * fwhm_L**2 + fwhm_G**2)
+    fwhm = calculate_fwhm(sigma, gamma)
     
     # Create a grid wide enough to capture the tails (20 * FWHM)
-    window = 20 * fwhm
+    window = 5 * fwhm
     if window == 0: window = 1.0 
     
     x_grid = np.linspace(cen - window, cen + window, 5000)
@@ -493,7 +505,11 @@ def process_time_series_by_peak(
     
     # Prepare viz directory
     viz_dir = pathlib.Path(output_dir) / sample_name / "peak_tracking_viz"
-    viz_dir.mkdir(parents=True, exist_ok=True)
+    if viz_dir.exists():
+    # use n+1 to avoid overwriting existing results
+        existing_dirs = [d for d in viz_dir.parent.iterdir() if d.is_dir() and d.name.startswith(viz_dir.name)]
+        viz_dir = viz_dir.parent / f"{viz_dir.name}_{len(existing_dirs)+1}"
+    viz_dir.mkdir(parents=True, exist_ok=False)
     
     for (peak_target, window_size, (start_idx, end_idx), peak_name) in peaks_definition:
         if debug:
@@ -549,12 +565,15 @@ def process_time_series_by_peak(
                 
                 # Ensure initial_guess is within bounds to avoid ValueError in curve_fit
                 initial_guess_clamped = np.clip(last_popt, lower_bounds, upper_bounds).tolist()
+
+                # Fit window is 2x the original FWHM estimate from previous fit, but at least 0.5° to allow for some movement
+                window_size = max(0.5, calculate_fwhm(popt_arr[2], popt_arr[3]) * 3)
                 
                 try:
                     _, popt = voigt_fit(
                         da_t, x="twoTheta_deg",
                         initial_guess=initial_guess_clamped,
-                        window_size=window_size * 1.5,
+                        window_size=window_size,
                         bounds=(lower_bounds, upper_bounds)
                     )
                     current_popt = popt
@@ -568,7 +587,7 @@ def process_time_series_by_peak(
             # --- Phase: SEARCH (Discovery) ---
             # If peak is lost (or tracking failed just now), we search
             if peak_lost:
-                peaks_x, intensity, _ = find_peaks_in_window(
+                peaks_x, intensity, props = find_peaks_in_window(
                     da_t, x="twoTheta_deg", 
                     target=peak_target, window_size=window_size, 
                     height=0.001
@@ -577,13 +596,14 @@ def process_time_series_by_peak(
                 if len(peaks_x) > 0:
                     best_idx = np.argmax(intensity)
                     peak_pos_guess = peaks_x[best_idx]
+                    peak_width = props[best_idx]['half_widths']
                     
                     try:
                         no_slope = peak_pos_guess > 10.0
                         _, popt = voigt_fit(
                             da_t, x="twoTheta_deg", 
                             initial_guess=peak_pos_guess, 
-                            window_size=window_size * 1.5, 
+                            window_size=max(0.5, peak_width * 4), 
                             no_slope=no_slope
                         )
                         current_popt = popt
@@ -592,47 +612,21 @@ def process_time_series_by_peak(
                     except RuntimeError:
                         pass
 
-            # --- Visualization (Found / Refound) ---
-            if fit_success and (peak_lost or not first_peak_found):
-                try:
-                    popt = current_popt # Ensure we use the current fit
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    plot_min, plot_max = peak_target - window_size, peak_target + window_size
-                    da_t.sel(twoTheta_deg=slice(plot_min, plot_max)).plot(ax=ax, label='Data')
-                    fit_x = np.linspace(plot_min, plot_max, 100)
-                    ax.plot(fit_x, voigt_profile_func(fit_x, *popt), 'r--', label='Fit')
-                    
-                    # add the fitting parameters as text
-                    param_text = f"Amp: {popt[0]:.4f}\nCen: {popt[1]:.4f}\nSigma: {popt[2]:.3f}\nGamma: {popt[3]:.3f}"
-                    if len(popt) == 6:
-                        param_text += f"\nSlope: {popt[4]:.4f}\nOffset: {popt[5]:.4f}"
-                    ax.text(0.05, 0.95, param_text, transform=ax.transAxes, fontsize=10,
-                            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                    
-                    status_text = "Refound" if peak_lost and first_peak_found else "Found"
-                    ax.set_title(f"'{peak_name}' {status_text} at t={t:.1f}s (idx {t_idx})")
-                    fig.savefig(viz_dir / f"{peak_name}_{status_text.lower()}_idx{t_idx}.png")
-                    plt.close(fig)
-                    
-                    first_peak_found = True
-                except Exception as e:
-                    if debug: logger.warning(f"Visualization failed: {e}")
-
             # --- Capture Result ---
             if fit_success:
                 try:
                     fit_result_obj = {'popt': current_popt}
-                    final_res = calculate_peak_areas(da_t, "twoTheta_deg", [fit_result_obj], confidence=0.95)[0]
+                    peak_area_res = calculate_peak_areas(da_t, "twoTheta_deg", [fit_result_obj], confidence=0.95)[0]
                     
                     ref_val = last_ref_time if not peak_lost else "Search"
                     
-                    if debug: logger.info(f"Captured peak '{peak_name}' at t={t:.1f}, Area={final_res['area']:.4f}")
+                    if debug: logger.info(f"Captured peak '{peak_name}' at t={t:.1f}, Area={peak_area_res['area']:.4f}")
 
                     exp_peak_results.append({
                         'Time': t,
                         'PeakName': peak_name,
-                        'Position': final_res['popt'][1],
-                        'Area': final_res['area'],
+                        'Position': peak_area_res['popt'][1],
+                        'Area': peak_area_res['area'],
                         'RefTime': ref_val
                     })
                     
@@ -646,6 +640,51 @@ def process_time_series_by_peak(
             else:
                 peak_lost = True
                 last_popt = None
+
+            # --- Visualization (Found / Refound) ---
+            if fit_success and (peak_lost or not first_peak_found or t_idx % 10 == 0):
+                try:
+                    popt = current_popt # Ensure we use the current fit
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    plot_min, plot_max = peak_target - window_size, peak_target + window_size
+                    da_t.sel(twoTheta_deg=slice(plot_min, plot_max)).plot(ax=ax, label='Data')
+                    # fill area that was integrated
+                    cen, slope, offset = popt[1], popt[4] if len(popt) == 6 else 0, popt[5] if len(popt) == 6 else 0
+                    l, r = peak_area_res['integration_range']
+                    background_func = lambda x: slope * (x - cen) + offset
+                    subset_x = da_t.sel(twoTheta_deg=slice(l, r))
+                    sunset_bg_vals = background_func(subset_x.twoTheta_deg)
+
+                    ax.fill_between(subset_x.twoTheta_deg, subset_x.values, sunset_bg_vals,
+                                    where=(subset_x.values > sunset_bg_vals),
+                                    alpha=0.3, color='orange', label='Integrated Area')
+                    # Use the fit window (3*FWHM) for plotting the fit, but limit to data range
+                    fwhm = calculate_fwhm(popt[2], popt[3])
+                    fit_x = np.linspace(max(plot_min, cen - 2 * fwhm), min(plot_max, cen + 2 * fwhm), 100)
+                    ax.plot(fit_x, voigt_profile_func(fit_x, *popt), 'r--', label='Fit')
+                    ax.axvline(l, linestyle=':', alpha=0.5)
+                    ax.axvline(r, linestyle=':', alpha=0.5)
+                    
+                    # add the fitting parameters as text
+                    param_text = f"Amp: {popt[0]:.4f}\nCen: {popt[1]:.4f}\nSigma: {popt[2]:.3f}\nGamma: {popt[3]:.3f}"
+                    if len(popt) == 6:
+                        param_text += f"\nSlope: {popt[4]:.4f}\nOffset: {popt[5]:.4f}"
+                    ax.text(0.05, 0.95, param_text, transform=ax.transAxes, fontsize=10,
+                            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    
+                    status_text = "Refound" if peak_lost and first_peak_found else "Found"
+                    ax.set_title(f"'{peak_name}' {status_text} at t={t:.1f}s (idx {t_idx})")
+                    fig.savefig(viz_dir / f"{peak_name}_{status_text.lower()}_idx{t_idx}.png")
+                    
+                    first_peak_found = True
+                except Exception as e:
+                    if debug: logger.warning(f"Visualization failed: {e}")
+                    raise
+                finally:
+                    plt.close(fig)
+
+
+
 
     # Format Output
     if debug: logger.info(f"Total results captured: {len(exp_peak_results)}")
