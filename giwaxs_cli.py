@@ -216,7 +216,7 @@ def main():
     parser.add_argument("exp_dir", type=str, help="Experiment directory path")
     parser.add_argument("--num_workers", type=int, default=None, help="Number of parallel workers (default: all cores minus one)")
     parser.add_argument("--save_csv", action="store_true", help="Whether to save integrated data as CSV in addition to NetCDF")
-    parser.add_argument("--output_dir", type=str, default='./results', help="Directory to save outputs (default: ./results)")
+    parser.add_argument("--output_dir", type=str, default='./processed', help="Directory to save outputs (default: ./processed)")
     args = parser.parse_args()
 
     exp_dir = Path(args.exp_dir)
@@ -231,14 +231,16 @@ def main():
             poni_file = next(exp_dir.parent.glob("*.poni"))
         except StopIteration:
             print(f"No PONI file found in {exp_dir} or its parent directory. Using default geometry parameters.")
-            poni_file = Path('./default_geometry.poni')
+            poni_file = Path('./default_calibrations/default_geometry.poni')
             if not poni_file.is_file():
-                raise FileNotFoundError("Default PONI file not found at './default_geometry.poni'. Please provide a PONI file in the experiment directory or its parent directory.")
+                raise FileNotFoundError("Default PONI file not found at './default_calibrations/default_geometry.poni'. Please provide a PONI file in the experiment directory or its parent directory.")
 
     # Find Calibrant file
     calibrant_file = Path(exp_dir.parents[1], "ito_calibrant.D")
     if not calibrant_file.is_file():
-        raise FileNotFoundError(f"Calibrant file not found at {calibrant_file}")
+        calibrant_file = Path('./default_calibrations/ito_calibrant.D')
+        if not calibrant_file.is_file():
+            raise FileNotFoundError(f"Calibrant file not found at {calibrant_file} or {Path('./default_calibrations/ito_calibrant.D')}. Please provide the calibrant file in the expected location.")
 
     frame_files = natsorted(list(exp_dir.glob("*.tif")))
     if not frame_files:
