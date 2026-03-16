@@ -902,6 +902,7 @@ def process_time_series_by_peak_lmfit(
         da_full: xr.DataArray,
         da_peak: xr.DataArray,
         da_background: xr.DataArray,
+        peak_center_guess: float|None = None,
         prev_fit_res=None,
     ):
         if peak_fiiting_model != "voigt":
@@ -920,7 +921,21 @@ def process_time_series_by_peak_lmfit(
         background_model = LinearModel(prefix='bkg_')
         peak_params.update(background_model.guess(da_background.values, da_background.twoTheta_deg.values))
         model = peak_model + background_model
-        return model.fit(da_full.values, peak_params, x=da_full.twoTheta_deg.values)
+        fit_res = model.fit(da_full.values, peak_params, x=da_full.twoTheta_deg.values)
+
+        if not fit_res.success:
+            raise RuntimeError(f"Fit failed: {fit_res.message}")
+        
+        if fit_res.params.get('peak_height', 0) < 0.005:
+             raise ValueError(f"Fitted peak height is too low ({fit_res.params.get('peak_height', 0):.4f}), likely a failed fit.")
+        
+        if peak_center_guess is not None:
+            delta_x = (da_peak.twoTheta_deg.values[-1] - da_peak.twoTheta_deg.values[0])/(len(da_peak.twoTheta_deg) - 1)
+            fitted_center = fit_res.params.get('peak_center')
+            if abs(fitted_center - peak_center_guess) > delta_x * 5:
+                    raise ValueError(f"Fitted peak center ({fitted_center:.3f}) is too far from guess ({peak_center_guess:.3f}), likely a failed fit.")
+
+        return fit_res
     
     for (expected_center, window_size, (start_idx, end_idx), peak_name) in peaks_definition:
 
@@ -963,6 +978,7 @@ def process_time_series_by_peak_lmfit(
                         da_peak=da_peak,
                         da_background=da_background,
                         prev_fit_res=last_popt['fit_res'],
+                        peak_center_guess=last_popt['fit_res'].best_values.get('peak_center')
                     )
                     
                     current_popt = {"fit_res": fit_res, "lb": lb, "rb": rb}
@@ -1010,6 +1026,7 @@ def process_time_series_by_peak_lmfit(
                             da_full=da_t,
                             da_peak=da_peak,
                             da_background=da_background,
+                            peak_center_guess=found_center
                         )
                         
                         current_popt = {"fit_res": fit_res, "lb": lb, "rb": rb}
@@ -1123,7 +1140,7 @@ def process_time_series_by_peak_lmfit(
                     status_text = "Tracked" if tracked_this_step else "Found"
                     ax.set_title(f"'{peak_name}' {status_text} at t={t:.1f}s (idx {t_idx})")
                     ax.legend(fontsize='small', framealpha=0.7)
-                    fig.savefig(viz_dir / f"{peak_name}_{status_text.lower()}_idx{t_idx}.png")
+                    fig.savefig(viz_dir / f"{peak_name}_idx{t_idx}_{status_text.lower()}.png")
                 except Exception as e:
                     if debug: logger.warning(f"Visualization failed: {e}")
                     raise
