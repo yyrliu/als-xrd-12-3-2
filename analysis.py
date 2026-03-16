@@ -12,7 +12,7 @@ from scipy.special import wofz
 from pybaselines import Baseline
 from vogit_width import voigt_width_at_height
 from scipy.linalg import LinAlgError
-from lmfit.models import VoigtModel, SplineModel
+from lmfit.models import VoigtModel, SplineModel, LinearModel
 from lmfit import Model
 from typing import Type
 
@@ -791,6 +791,41 @@ def process_time_series_by_peak(
         if debug: logger.warning("No results collected for this experiment.")
         return pd.DataFrame()
 
+def _apply_temporal_peak_constraints(peak_params, prev_fit_res):
+    if prev_fit_res is None:
+        return peak_params
+    prev = prev_fit_res.best_values
+    prev_center = prev.get('peak_center')
+    prev_sigma = prev.get('peak_sigma')
+    prev_gamma = prev.get('peak_gamma')
+    prev_amp = prev.get('peak_amplitude')
+
+    if prev_center is not None and prev_sigma is not None and prev_gamma is not None:
+        prev_fwm = max(voigt_width_at_height(prev_sigma, prev_gamma, 0.5), 0.05)
+        center_half_window = max(0.08, 0.35 * prev_fwm)
+        peak_params['peak_center'].set(
+            value=prev_center,
+            min=prev_center - center_half_window,
+            max=prev_center + center_half_window,
+        )
+
+    if prev_sigma is not None:
+        sigma_low = max(1e-9, prev_sigma * 0.6)
+        sigma_high = max(sigma_low * 1.01, prev_sigma * 1.6)
+        peak_params['peak_sigma'].set(value=prev_sigma, min=sigma_low, max=sigma_high)
+
+    if prev_gamma is not None:
+        gamma_low = max(1e-9, prev_gamma * 0.6)
+        gamma_high = max(gamma_low * 1.01, prev_gamma * 1.6)
+        peak_params['peak_gamma'].set(value=prev_gamma, min=gamma_low, max=gamma_high)
+
+    if prev_amp is not None:
+        amp_low = max(1e-6, prev_amp * 0.4)
+        amp_high = max(amp_low * 1.01, prev_amp * 2.5)
+        peak_params['peak_amplitude'].set(value=prev_amp, min=amp_low, max=amp_high)
+
+    return peak_params
+
 def process_time_series_by_peak_lmfit(
     time_series_da: xr.DataArray,
     peaks_definition: list,
@@ -801,20 +836,58 @@ def process_time_series_by_peak_lmfit(
     integration_bounds_by_fwm: dict|None = None,
     substract_baseline: bool = True,
     debug: bool = False,
+    temporal_peak_constraints: bool = False,
 ) -> pd.DataFrame:
     """
-    Process time series data peak-by-peak with bi-directional tracking.
-    
-    Parameters:
-    peaks_definition : list of tuples
-        Format: [(target_pos, window_size, (start_idx, end_idx), peak_name), ...]
-        start_idx: Index to start tracking from.
-        end_idx: Index to end at (inclusive). 
-                 If start < end, tracks forward. If start > end, tracks backward.
+    Track GIWAXS peak areas over time using an lmfit Voigt + linear background model.
+
+    Parameters
+    ----------
+    time_series_da : xr.DataArray
+        Input time series with dimensions including `time` and `twoTheta_deg`.
+    peaks_definition : list[tuple]
+        Peak definitions as `(expected_center, window_size, (start_idx, end_idx), peak_name)`.
+        `start_idx`/`end_idx` are inclusive and define tracking direction.
+    sample_name : str
+        Sample label used to create visualization output directory.
+    output_dir : str
+        Base directory for tracking visualization output.
+    fitting_bounds_by : str, default "half_width"
+        Search window method: "half_width" or "prominence".
+    peak_fiiting_model : str | Type[Model], default "voigt"
+        Peak model to use. Currently only "voigt" is supported.
+    integration_bounds_by_fwm : dict | None, default None
+        Integration width config. Expected keys: `height`, `multiplier`.
+    substract_baseline : bool, default True
+        Subtract fitted background area from integrated area.
+    debug : bool, default False
+        Enable debug logging.
+    temporal_peak_constraints : bool, default False
+        If True, constrain current Voigt parameters around previous fit.
+
+    Returns
+    -------
+    pd.DataFrame
+        MultiIndex columns with `Area` and `BackgroundArea` per `PeakName`, indexed by `Time`.
     """
+    if integration_bounds_by_fwm is None:
+        raise ValueError("integration_bounds_by_fwm is required and must include 'height' and 'multiplier'.")
+    if not isinstance(integration_bounds_by_fwm, dict):
+        raise TypeError("integration_bounds_by_fwm must be a dict with keys 'height' and 'multiplier'.")
+
+    required_keys = {"height", "multiplier"}
+    missing_keys = required_keys - set(integration_bounds_by_fwm.keys())
+    if missing_keys:
+        raise ValueError(f"integration_bounds_by_fwm missing required keys: {sorted(missing_keys)}")
+
+    if integration_bounds_by_fwm["height"] <= 0 or integration_bounds_by_fwm["height"] >= 1:
+        raise ValueError("integration_bounds_by_fwm['height'] must be in (0, 1).")
+    if integration_bounds_by_fwm["multiplier"] <= 0:
+        raise ValueError("integration_bounds_by_fwm['multiplier'] must be > 0.")
+
     times = time_series_da.time.values
     num_times = len(times)
-    
+
     exp_peak_results = []
     
     # Prepare viz directory
@@ -824,6 +897,30 @@ def process_time_series_by_peak_lmfit(
         existing_dirs = [d for d in viz_dir.parent.iterdir() if d.is_dir() and d.name.startswith(viz_dir.name)]
         viz_dir = viz_dir.parent / f"{viz_dir.name}_{len(existing_dirs)+1}"
     viz_dir.mkdir(parents=True, exist_ok=False)
+
+    def _fit_voigt_linear_background(
+        da_full: xr.DataArray,
+        da_peak: xr.DataArray,
+        da_background: xr.DataArray,
+        prev_fit_res=None,
+    ):
+        if peak_fiiting_model != "voigt":
+            raise ValueError(f"Unsupported peak fitting model: {peak_fiiting_model}")
+
+        peak_model = VoigtModel(prefix='peak_')
+        peak_params = peak_model.guess(da_peak.values, x=da_peak.twoTheta_deg.values)
+        peak_params['peak_gamma'].vary = True
+        peak_params['peak_gamma'].min = 1e-9
+        peak_params['peak_sigma'].min = 1e-9
+        peak_params['peak_amplitude'].min = 1e-4
+
+        if temporal_peak_constraints and prev_fit_res is not None:
+            peak_params = _apply_temporal_peak_constraints(peak_params, prev_fit_res)
+
+        background_model = LinearModel(prefix='bkg_')
+        peak_params.update(background_model.guess(da_background.values, da_background.twoTheta_deg.values))
+        model = peak_model + background_model
+        return model.fit(da_full.values, peak_params, x=da_full.twoTheta_deg.values)
     
     for (expected_center, window_size, (start_idx, end_idx), peak_name) in peaks_definition:
 
@@ -838,10 +935,8 @@ def process_time_series_by_peak_lmfit(
         # Python range stop is exclusive, so we add step
         processing_indices = range(start_idx, end_idx + step, step)
         
-        peak_lost = True
         last_popt = None
-        last_ref_time = None
-        first_peak_found = False
+        last_fwm = None
         
         for t_idx in processing_indices:
             if t_idx < 0 or t_idx >= num_times: continue
@@ -852,47 +947,38 @@ def process_time_series_by_peak_lmfit(
 
             fit_success = False
             current_popt = None
+            tracked_this_step = False
             
             # --- Phase: TRACK (Optimization) ---
             # Try to track if we have a previous fix
-            # if not peak_lost:
-            if False:
+            if last_popt is not None:
 
                 lb, rb = last_popt['lb'], last_popt['rb']
                 da_peak = da_t.sel(twoTheta_deg=slice(lb, rb))
                 da_background = da_t.where(~((da_t.twoTheta_deg > lb) & (da_t.twoTheta_deg < rb)), drop=True)
                 
                 try:
-                    if peak_fiiting_model == "voigt":
-                        peak_model = VoigtModel(prefix='peak_')
-                    else:
-                        raise ValueError(f"Unsupported peak fitting model: {peak_fiiting_model}")
-                    
-                    peak_params = peak_model.guess(da_peak.values, x=da_peak.twoTheta_deg.values)
-                    peak_params['peak_gamma'].vary = True
-                    peak_params['peak_gamma'].min = 1e-9
-                    peak_params['peak_sigma'].min = 1e-9
-                    peak_params['peak_amplitude'].min = 1e-4
-
-                    knot_xvals = da_background.twoTheta_deg.values[::max(3, len(da_background)//5)]
-                    background_model = SplineModel(prefix='bkg_', xknots=knot_xvals)
-                    peak_params.update(background_model.guess(da_t.values, da_t.twoTheta_deg.values))
-                    model = peak_model + background_model
-                    fit_res = model.fit(da_t.values, peak_params, x=da_t.twoTheta_deg.values)
+                    fit_res = _fit_voigt_linear_background(
+                        da_full=da_t,
+                        da_peak=da_peak,
+                        da_background=da_background,
+                        prev_fit_res=last_popt['fit_res'],
+                    )
                     
                     current_popt = {"fit_res": fit_res, "lb": lb, "rb": rb}
                     fit_success = True
+                    tracked_this_step = True
 
                 except Exception as e:
                     fit_success = False
-                    peak_lost = True
                     last_popt = None
+                    last_fwm = None
                     if debug: 
                         logger.info(f"  Tracking lost at t={t:.1f}s (Error: {e}). Switching to search.")
 
             # --- Phase: SEARCH (Discovery) ---
-            # If peak is lost (or tracking failed just now), we search
-            if peak_lost:
+            # If no tracked fit is available (or tracking failed), search peak in current frame
+            if not fit_success:
                 peaks_x, intensity, props = find_peaks_in_window(
                     da_t, x="twoTheta_deg", 
                     target=expected_center, 
@@ -917,60 +1003,47 @@ def process_time_series_by_peak_lmfit(
                         raise ValueError(f"Invalid fit_bounds_by value: {fitting_bounds_by}. Use 'half_width' or 'prominence'.")
                     
                     try:
-
                         da_peak = da_t.sel(twoTheta_deg=slice(lb, rb))
                         da_background = da_t.where(~((da_t.twoTheta_deg > lb) & (da_t.twoTheta_deg < rb)), drop=True)
 
-                        if peak_fiiting_model == "voigt":
-                            peak_model = VoigtModel(prefix='peak_')
-                        else:
-                            raise ValueError(f"Unsupported peak fitting model: {peak_fiiting_model}")
-                        
-                        peak_params = peak_model.guess(da_peak.values, x=da_peak.twoTheta_deg.values)
-                        peak_params['peak_gamma'].vary = True
-                        peak_params['peak_gamma'].min = 1e-9
-                        peak_params['peak_sigma'].min = 1e-9
-                        peak_params['peak_amplitude'].min = 1e-4
-
-                        knot_xvals = da_background.twoTheta_deg.values[::max(3, len(da_background)//5)]
-                        background_model = SplineModel(prefix='bkg_', xknots=knot_xvals)
-                        peak_params.update(background_model.guess(da_t.values, da_t.twoTheta_deg.values))
-                        model = peak_model + background_model
-                        fit_res = model.fit(da_t.values, peak_params, x=da_t.twoTheta_deg.values)
+                        fit_res = _fit_voigt_linear_background(
+                            da_full=da_t,
+                            da_peak=da_peak,
+                            da_background=da_background,
+                        )
                         
                         current_popt = {"fit_res": fit_res, "lb": lb, "rb": rb}
                         fit_success = True
                         
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if debug:
+                            logger.debug(f"Search fit failed for '{peak_name}' at t={t:.1f}s: {e}")
 
             # --- Capture Result ---
-            
             if fit_success:
                 try:
-                    if integration_bounds_by_fwm is not None:
-                        fit_popt = current_popt["fit_res"].best_values
-                        amplitude, center, sigma, gamma = fit_popt['peak_amplitude'], fit_popt['peak_center'], fit_popt['peak_sigma'], fit_popt['peak_gamma']
-                        fwm = voigt_width_at_height(sigma, gamma, integration_bounds_by_fwm['height']) * integration_bounds_by_fwm['multiplier']
-                        int_range = (center - fwm/2, center + fwm/2)
-                        area = da_t.sel(twoTheta_deg=slice(*int_range)).integrate(coord="twoTheta_deg").item()
-
-                        background_area = 0
-                        if substract_baseline:
-                            fit_x = current_popt["fit_res"].eval_components(x=da_t.twoTheta_deg.values)
-                            da_background_fit = xr.DataArray(fit_x['bkg_'], coords=da_t.coords)
-                            background_area = da_background_fit.sel(twoTheta_deg=slice(*int_range)).integrate(coord="twoTheta_deg").item()
-
-                        peak_area_res = {
-                            'area': area - background_area,
-                            'background_area': background_area,
-                            'integration_range': int_range,
-                            'popt': fit_popt | { "lb": current_popt['lb'], "rb": current_popt['rb'] }
-                        }
+                    fit_popt = current_popt["fit_res"].best_values
+                    center, sigma, gamma = fit_popt['peak_center'], fit_popt['peak_sigma'], fit_popt['peak_gamma']
+                    fwm_raw = voigt_width_at_height(sigma, gamma, integration_bounds_by_fwm['height']) * integration_bounds_by_fwm['multiplier']
+                    if last_fwm is not None and np.isfinite(last_fwm):
+                        fwm = float(np.clip(fwm_raw, last_fwm * 0.75, last_fwm * 1.25))
                     else:
-                        raise ValueError("Currently only integration_bounds_by_fwm method is implemented for lmfit version. Please provide integration_bounds_by_fwm parameter.")
+                        fwm = fwm_raw
+                    int_range = (center - fwm/2, center + fwm/2)
+                    area = da_t.sel(twoTheta_deg=slice(*int_range)).integrate(coord="twoTheta_deg").item()
 
-                    ref_val = last_ref_time if not peak_lost else "Search"
+                    background_area = 0
+                    if substract_baseline:
+                        fit_x = current_popt["fit_res"].eval_components(x=da_t.twoTheta_deg.values)
+                        da_background_fit = xr.DataArray(fit_x['bkg_'], coords=da_t.coords)
+                        background_area = da_background_fit.sel(twoTheta_deg=slice(*int_range)).integrate(coord="twoTheta_deg").item()
+
+                    peak_area_res = {
+                        'area': area - background_area,
+                        'background_area': background_area,
+                        'integration_range': int_range,
+                        'popt': fit_popt | { "lb": current_popt['lb'], "rb": current_popt['rb'] }
+                    }
                     
                     if debug: logger.info(f"Captured peak '{peak_name}' at t={t:.1f}, Area={peak_area_res['area']:.4f}")
 
@@ -980,25 +1053,23 @@ def process_time_series_by_peak_lmfit(
                         'Position': peak_area_res['popt']['peak_center'],
                         'Area': peak_area_res['area'],
                         'BackgroundArea': peak_area_res['background_area'],
-                        'RefTime': ref_val
+                        'RefType': 'Track' if tracked_this_step else 'Search'
                     })
                     
                     last_popt = current_popt
-                    last_ref_time = t
+                    last_fwm = fwm if integration_bounds_by_fwm is not None else last_fwm
                 except Exception as e:
                     msg = f"Failed to capture result at t={t}: {e}"
                     logger.error(msg)
-                    peak_lost = True
                     fit_success = False
                     last_popt = None
+                    last_fwm = None
             else:
-                peak_lost = True
                 last_popt = None
+                last_fwm = None
 
             # --- Visualization (Found / Refound) ---
-            # if fit_success and (peak_lost or not first_peak_found or t_idx % 10 == 0):
-            # if fit_success and (peak_lost or not first_peak_found or t_idx % 10 == 0):
-            if False:
+            if fit_success and ((not tracked_this_step) or t_idx % 10 == 0):
                 try:
                     fit_res = current_popt['fit_res']
                     fit_vals = fit_res.best_values
@@ -1049,20 +1120,15 @@ def process_time_series_by_peak_lmfit(
                     ax.text(0.05, 0.95, param_text, transform=ax.transAxes, fontsize=10,
                             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-                    status_text = "Refound" if peak_lost and first_peak_found else "Found"
+                    status_text = "Tracked" if tracked_this_step else "Found"
                     ax.set_title(f"'{peak_name}' {status_text} at t={t:.1f}s (idx {t_idx})")
                     ax.legend(fontsize='small', framealpha=0.7)
                     fig.savefig(viz_dir / f"{peak_name}_{status_text.lower()}_idx{t_idx}.png")
-                    
-                    first_peak_found = True
                 except Exception as e:
                     if debug: logger.warning(f"Visualization failed: {e}")
                     raise
                 finally:
                     plt.close(fig)
-
-
-
 
     # Format Output
     if debug: logger.info(f"Total results captured: {len(exp_peak_results)}")
