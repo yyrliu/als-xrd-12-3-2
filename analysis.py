@@ -73,6 +73,9 @@ def find_peaks_in_window(da: xr.DataArray, x: str, target=None, window_size=None
     peaks_indices, properties = find_peaks(da.values, **find_peaks_kwargs)
     half_widths = peak_widths(da.values, peaks_indices, rel_height=0.5)
 
+    if len(peaks_indices) == 0:
+        return np.array([]), np.array([]), []
+
     # convert indices back to original x values (wavelength or twoTheta)
     peaks_x = da[x].values[peaks_indices]
     # get intensities at peak positions
