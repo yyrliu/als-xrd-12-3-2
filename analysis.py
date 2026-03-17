@@ -928,7 +928,8 @@ def process_time_series_by_peak_lmfit(
         
         if fit_res.params.get('peak_height', 0) < 0.005:
              raise ValueError(f"Fitted peak height is too low ({fit_res.params.get('peak_height', 0):.4f}), likely a failed fit.")
-        
+        if fit_res.params.get('peak_height', 0) > da_full.max().item() * 1.5:
+             raise ValueError(f"Fitted peak height ({fit_res.params.get('peak_height', 0):.4f}) is unreasonably high compared to data max ({da_full.max().item():.4f}), likely a failed fit.")
         if peak_center_guess is not None:
             delta_x = (da_peak.twoTheta_deg.values[-1] - da_peak.twoTheta_deg.values[0])/(len(da_peak.twoTheta_deg) - 1)
             fitted_center = fit_res.params.get('peak_center')
