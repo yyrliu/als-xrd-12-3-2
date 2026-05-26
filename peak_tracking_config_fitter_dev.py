@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+DEFAULT_OUTPUT_ROOT = Path(
+    r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\agent_temp"
+)
+
+
+def _mabai_peaks() -> list[tuple]:
+    return [
+        (7.23, 2, (-1, 0), "2D (002)", {"drift_tolerance_deg": 0.05}),
+        (9.2, 1, (-1, 0), "1D (002)", {"drift_tolerance_deg": 0.05}),
+        (13.6, 2, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
+        (30.3, 2, (0, -1), "ITO", {"drift_tolerance_deg": 0.05}),
+    ]
+
+
+def _meombai_peaks() -> list[tuple]:
+    return [
+        (6.0, 0.5, (-1, 0), "2D (002)", {"drift_tolerance_deg": 0.15}),
+        (13.3, 2.0, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
+        (6.8, 0.5, (-1, 0), "MeOMBAI", {"drift_tolerance_deg": 0.05}),
+    ]
+
+def _clmbai_peaks() -> list[tuple]:
+    return [
+        (6.4, 1, (-1, 25), "2D (002)", {
+            "drift_tolerance_deg": 0.05,
+            "fitter": {"kind": "voigt_exp", "fit_half_width_deg": 0.4},
+        }),
+        (7.3, 0.5, (-1, 0), "ClMBAI", {"drift_tolerance_deg": 0.05}),
+        (13.3, 2, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
+        (30.3, 2, (0, -1), "ITO", {"drift_tolerance_deg": 0.05}),
+    ]
+
+
+RUN_CONFIGS = {
+    # Demo presets for additive vs restrict key_frame behavior
+    "MeOMBAI_demo_additive": {
+        "da_file": Path(r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\MeOMBAI_120c_aging_1 004868 Images.nc"),
+        "global_shift_deg": 0.0,
+        "keyframe_plot_margin_deg": 5.0,
+        "peaks": [
+            (6.0, 0.5, (0, -1), "2D (002)", {"key_frames": [0, 3], "key_frames_mode": "additive", "auto_keyframe_every": 15}),
+        ],
+    },
+    "MeOMBAI_demo_restrict": {
+        "da_file": Path(r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\MeOMBAI_120c_aging_1 004868 Images.nc"),
+        "global_shift_deg": 0.0,
+        "keyframe_plot_margin_deg": 5.0,
+        "peaks": [
+            (6.0, 0.5, (0, -1), "2D (002)", {"key_frames": [0, 2], "key_frames_mode": "restrict", "auto_keyframe_every": 15}),
+        ],
+    },
+    "ClMBAI_demo_restrict_voigt_exp": {
+        "da_file": Path(r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\ClMBAI_0M5_1 004910 Images.nc"),
+        "global_shift_deg": 0.0,
+        "keyframe_plot_margin_deg": 1.5,
+        "peaks": [
+            (6.4, 1.0, (-1, 25), "2D (002)", {
+                "key_frames": [453, 738, 828],
+                "key_frames_mode": "restrict",
+                "auto_keyframe_every": 15,
+                "fitter": {"kind": "voigt_exp", "fit_half_width_deg": 0.4},
+            }),
+        ],
+    },
+    "ClMBAI_demo_restrict_double_voigt": {
+        "da_file": Path(r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\ClMBAI_0M5_1 004910 Images.nc"),
+        "global_shift_deg": 0.0,
+        "keyframe_plot_margin_deg": 1.5,
+        "peaks": [
+            (6.4, 1.0, (-1, 25), "2D (002)", {
+                "key_frames": [453, 738, 828],
+                "key_frames_mode": "restrict",
+                "auto_keyframe_every": 15,
+                "fitter": {
+                    "kind": "double_voigt_linear",
+                    "fit_half_width_deg": 0.4,
+                    "kwargs": {
+                        "background_peak_center_deg": 4.75,
+                        "background_peak_sigma": 0.28,
+                    },
+                },
+            }),
+        ],
+    },
+}
+
+
+PEAK_PRESETS = {
+    "MBAI": _mabai_peaks(),
+    "MeOMBAI": _meombai_peaks(),
+    "ClMBAI": _clmbai_peaks(),
+}
