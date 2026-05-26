@@ -131,3 +131,9 @@ plt.title("Integration at Frame 10")
 plt.show()
 ```
 
+## 6. Peak Tracking Workflow
+
+The newer config-driven peak tracking pipeline is documented in [PEAK_TRACKING_WORKFLOW.md](PEAK_TRACKING_WORKFLOW.md).
+
+Use it when you want per-peak tracking, raw and normalized CSV exports, plots, and custom `lmfit` model hooks.
+

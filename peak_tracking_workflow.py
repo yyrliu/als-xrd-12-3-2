@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -1002,19 +1003,49 @@ def list_run_presets() -> None:
         print(f"{key}: {value['da_file']}")
 
 
+def _run_one(name: str, output_root: Path, retries: int = 3) -> tuple[str, int, Path]:
+    """Run a single preset and return (name, row_count, run_dir). Retries on failure."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            config = build_run_config_from_name(name, output_root=output_root)
+            df, run_dir = run_peak_tracking(config)
+            return name, len(df), run_dir
+        except Exception as exc:
+            last_exc = exc
+            logging.warning("Run %r failed on attempt %d/%d: %s", name, attempt, retries, exc)
+    raise RuntimeError(f"Run {name!r} failed after {retries} attempts") from last_exc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Peak tracking and integration workflow")
-    parser.add_argument("--run", choices=sorted(RUN_CONFIGS.keys()), help="Run preset to process")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--run", choices=sorted(RUN_CONFIGS.keys()), help="Run a single preset")
+    group.add_argument("--run-all", action="store_true", help="Run all presets in RUN_CONFIGS in parallel")
     parser.add_argument("--list-runs", action="store_true", help="List available run presets")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Override output root")
+    parser.add_argument(
+        "--jobs", type=int, default=-1,
+        help="Number of parallel jobs for --run-all (default: -1 = all CPU cores)",
+    )
     args = parser.parse_args()
 
     if args.list_runs:
         list_run_presets()
         return 0
 
+    if args.run_all:
+        names = sorted(RUN_CONFIGS.keys())
+        print(f"Running {len(names)} presets with {args.jobs} workers...")
+        results = joblib.Parallel(n_jobs=args.jobs, backend="loky", verbose=10)(
+            joblib.delayed(_run_one)(name, args.output_root) for name in names
+        )
+        for name, nrows, run_dir in results:
+            print(f"  {name}: {nrows} rows -> {run_dir}")
+        return 0
+
     if not args.run:
-        parser.error("--run is required unless --list-runs is used")
+        parser.error("--run or --run-all is required unless --list-runs is used")
 
     config = build_run_config_from_name(args.run, output_root=args.output_root)
     df, run_dir = run_peak_tracking(config)
