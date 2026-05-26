@@ -364,11 +364,17 @@ def initialize_params(
 
     slope, intercept = _linear_background_guess(x_vals, y_vals)
     peak_height = max(float(np.nanmax(y_vals) - np.nanmedian(y_vals)), 1e-6)
-    sigma_floor = max(0.01, peak_spec.window_deg / 50)
-    sigma_ceiling = max(peak_spec.window_deg, peak_spec.drift_tolerance_deg * 4)
+    # When fit_half_width_deg is set, use the actual fit window for sigma bounds
+    # rather than the (usually larger) integration window_deg.  This allows the
+    # optimizer to find sharper peaks that would otherwise hit the sigma floor
+    # computed from the wider integration window.
+    _fit_hw = peak_spec.fitter.fit_half_width_deg
+    effective_window = min(peak_spec.window_deg, 2 * _fit_hw) if _fit_hw else peak_spec.window_deg
+    sigma_floor = max(0.01, effective_window / 50)
+    sigma_ceiling = max(effective_window, peak_spec.drift_tolerance_deg * 4)
     # Initialize gamma narrower (window/16 instead of window/8) to start closer to
     # a physically realistic peak width for perovskite GIWAXS peaks (~0.05-0.1 deg).
-    gamma_init = max(peak_spec.window_deg / 16, sigma_floor)
+    gamma_init = max(effective_window / 16, sigma_floor)
     # VoigtModel amplitude is the profile *area* (integral), not the peak height.
     # For the Lorentzian limit: height = amplitude / (pi * gamma), so
     # amplitude = height * pi * gamma.  This initialization keeps the starting
