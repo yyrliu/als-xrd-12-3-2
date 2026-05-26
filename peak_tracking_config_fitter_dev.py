@@ -37,6 +37,29 @@ def _clmbai_peaks() -> list[tuple]:
 
 
 RUN_CONFIGS = {
+    # ── insitu_0.5M_MBAI fitter development ──────────────────────────────────
+    # Problem: 2D (002) at ~7.23° is physically sharp (FWHM ~0.1-0.2°), but the
+    # default voigt_linear fitter uses window_deg=2 → sigma_floor=0.04°, so sigma
+    # hits the floor and the fit underestimates the peak.  The background also has
+    # a steep exponential decay (from the large peak near 4.6°) that a linear
+    # baseline cannot model.  Fix: voigt_exp + narrow fit_half_width_deg to lower
+    # sigma_floor to 0.016° (effective_window=0.8 → 0.8/50) and handle the background.
+    "insitu_0.5M_MBAI_dev": {
+        "da_file": Path(
+            r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\MBAI_0M5_3 004909 Images.nc"
+        ),
+        "global_shift_deg": 0.0,
+        "keyframe_plot_margin_deg": 2.0,
+        "peaks": [
+            (7.23, 2, (-1, 0), "2D (002)", {
+                "drift_tolerance_deg": 0.05,
+                "fitter": {"kind": "voigt_exp", "fit_half_width_deg": 0.4},
+            }),
+            (9.2, 1, (-1, 0), "1D (002)", {"drift_tolerance_deg": 0.05}),
+            (13.6, 2, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
+            (30.3, 2, (0, -1), "ITO", {"drift_tolerance_deg": 0.05}),
+        ],
+    },
     # Demo presets for additive vs restrict key_frame behavior
     "MeOMBAI_demo_additive": {
         "da_file": Path(r"G:\Shared drives\Sutter-Fella Lab\ALS_Beamtimes\2026\Yi-Ru_Feb2026\processed\MeOMBAI_120c_aging_1 004868 Images.nc"),

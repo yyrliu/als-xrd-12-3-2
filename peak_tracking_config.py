@@ -10,7 +10,10 @@ DEFAULT_OUTPUT_ROOT = Path(
 
 def _mabai_peaks() -> list[tuple]:
     return [
-        (7.23, 2, (-1, 0), "2D (002)", {"drift_tolerance_deg": 0.05}),
+        (7.23, 2, (-1, 0), "2D (002)", {
+            "drift_tolerance_deg": 0.05,
+            "fitter": {"kind": "voigt_exp", "fit_half_width_deg": 0.4},
+        }),
         (9.2, 1, (-1, 0), "1D (002)", {"drift_tolerance_deg": 0.05}),
         (13.6, 2, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
         (30.3, 2, (0, -1), "ITO", {"drift_tolerance_deg": 0.05}),
@@ -22,6 +25,7 @@ def _meombai_peaks() -> list[tuple]:
         (6.0, 0.5, (-1, 0), "2D (002)", {"drift_tolerance_deg": 0.15}),
         (13.3, 2.0, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
         (6.8, 0.5, (-1, 0), "MeOMBAI", {"drift_tolerance_deg": 0.05}),
+        (30.3, 2, (0, -1), "ITO", {"drift_tolerance_deg": 0.05}),
     ]
 
 def _clmbai_peaks() -> list[tuple]:
