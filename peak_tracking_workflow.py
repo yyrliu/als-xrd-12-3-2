@@ -32,6 +32,7 @@ class FitterSpec:
     kind: str = "voigt_linear"
     factory: str | Callable[..., Any] | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
+    fit_half_width_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +125,7 @@ def load_time_series(da_file: Path, wavelength_a: float = DEFAULT_WAVELENGTH_A) 
         if "q_A^-1" not in data.coords:
             raise ValueError("Input data must contain either 'twoTheta_deg' or 'q_A^-1'.")
         two_theta = np.rad2deg(2 * np.arcsin(data["q_A^-1"] * wavelength_a / (4 * np.pi)))
-        data = data.assign_coords({"twoTheta_deg": ("q_A^-1", two_theta.values)}).swap_dims({"q_A^-1": "twoTheta_deg"})
+        data = data.assign_coords({"twoTheta_deg": ("q_A^-1", np.asarray(two_theta))}).swap_dims({"q_A^-1": "twoTheta_deg"})
 
     if "time" not in data.dims:
         raise ValueError("Input data must have a 'time' dimension.")
@@ -303,6 +304,11 @@ def _linear_background_guess(x_vals: np.ndarray, y_vals: np.ndarray) -> tuple[fl
     return float(slope), float(intercept)
 
 
+def _exp_background(x: np.ndarray, amplitude: float, decay: float) -> np.ndarray:
+    x0 = float(np.nanmin(x)) if np.size(x) else 0.0
+    return amplitude * np.exp(decay * (x - x0))
+
+
 def build_model_bundle(peak_spec: PeakSpec) -> FitBundle:
     fitter = peak_spec.fitter
 
@@ -326,10 +332,14 @@ def build_model_bundle(peak_spec: PeakSpec) -> FitBundle:
         return FitBundle(VoigtModel(prefix="peak_") + LinearModel(prefix="bkg_"), kind, ("peak_", "bkg_"))
     if kind == "voigt_constant":
         return FitBundle(VoigtModel(prefix="peak_") + ConstantModel(prefix="bkg_"), kind, ("peak_", "bkg_"))
+    if kind == "voigt_exp":
+        return FitBundle(VoigtModel(prefix="peak_") + Model(_exp_background, prefix="bkg_"), kind, ("peak_", "bkg_"))
     if kind == "gaussian_linear":
         return FitBundle(GaussianModel(prefix="peak_") + LinearModel(prefix="bkg_"), kind, ("peak_", "bkg_"))
     if kind == "pseudo_voigt_linear":
         return FitBundle(PseudoVoigtModel(prefix="peak_") + LinearModel(prefix="bkg_"), kind, ("peak_", "bkg_"))
+    if kind == "double_voigt_linear":
+        return FitBundle(VoigtModel(prefix="peak_") + VoigtModel(prefix="bkg_peak_") + LinearModel(prefix="bkg_lin_"), kind, ("peak_", "bkg_peak_", "bkg_lin_"))
     if kind == "voigt":
         return FitBundle(VoigtModel(prefix="peak_"), kind, ("peak_",))
 
@@ -353,21 +363,32 @@ def initialize_params(
 
     slope, intercept = _linear_background_guess(x_vals, y_vals)
     peak_height = max(float(np.nanmax(y_vals) - np.nanmedian(y_vals)), 1e-6)
-    params["peak_amplitude"].set(value=peak_height, min=1e-6)
+    sigma_floor = max(0.01, peak_spec.window_deg / 50)
+    sigma_ceiling = max(peak_spec.window_deg, peak_spec.drift_tolerance_deg * 4)
+    # Initialize gamma narrower (window/16 instead of window/8) to start closer to
+    # a physically realistic peak width for perovskite GIWAXS peaks (~0.05-0.1 deg).
+    gamma_init = max(peak_spec.window_deg / 16, sigma_floor)
+    # VoigtModel amplitude is the profile *area* (integral), not the peak height.
+    # For the Lorentzian limit: height = amplitude / (pi * gamma), so
+    # amplitude = height * pi * gamma.  This initialization keeps the starting
+    # model height close to the data peak and avoids the optimizer starting from
+    # an amplitude value that is ~8x too large.
+    amplitude_init = peak_height * np.pi * gamma_init
+    params["peak_amplitude"].set(value=amplitude_init, min=1e-6)
     params["peak_center"].set(
         value=candidate_center,
         min=candidate_center - peak_spec.drift_tolerance_deg,
         max=candidate_center + peak_spec.drift_tolerance_deg,
     )
     params["peak_sigma"].set(
-        value=max(peak_spec.window_deg / 8, 1e-3),
-        min=1e-6,
-        max=max(peak_spec.window_deg, peak_spec.drift_tolerance_deg * 4),
+        value=gamma_init,
+        min=sigma_floor,
+        max=sigma_ceiling,
     )
     params["peak_gamma"].set(
-        value=max(peak_spec.window_deg / 8, 1e-3),
-        min=1e-6,
-        max=max(peak_spec.window_deg, peak_spec.drift_tolerance_deg * 4),
+        value=gamma_init,
+        min=sigma_floor,
+        max=sigma_ceiling,
     )
 
     if "peak_fraction" in params:
@@ -378,12 +399,45 @@ def initialize_params(
         params["bkg_intercept"].set(value=intercept)
     if "bkg_c" in params:
         params["bkg_c"].set(value=intercept)
+    if "bkg_amplitude" in params:
+        positive_y = np.clip(y_vals, 1e-6, None)
+        try:
+            exp_slope, exp_intercept = np.polyfit(x_vals, np.log(positive_y), 1)
+            amp_guess = float(np.exp(exp_intercept))
+            decay_guess = float(exp_slope)
+        except Exception:
+            amp_guess = float(max(np.nanmedian(y_vals), 1e-6))
+            decay_guess = -0.5
+        params["bkg_amplitude"].set(value=amp_guess, min=1e-6)
+        if "bkg_decay" in params:
+            params["bkg_decay"].set(value=min(decay_guess, -1e-6), min=-10.0, max=0.0)
+    if "bkg_peak_amplitude" in params:
+        background_center = peak_spec.fitter.kwargs.get("background_peak_center_deg", candidate_center - max(peak_spec.window_deg * 2.0, 1.0))
+        background_sigma = float(peak_spec.fitter.kwargs.get("background_peak_sigma", max(peak_spec.window_deg, 0.35)))
+        background_gamma = float(peak_spec.fitter.kwargs.get("background_peak_gamma", background_sigma))
+        background_amp = float(peak_spec.fitter.kwargs.get("background_peak_amplitude", max(0.5 * peak_height, 1e-6)))
+        params["bkg_peak_amplitude"].set(value=background_amp, min=1e-6)
+        params["bkg_peak_center"].set(
+            value=background_center,
+            min=background_center - max(0.35, peak_spec.window_deg * 0.25),
+            max=background_center + max(0.35, peak_spec.window_deg * 0.25),
+        )
+        params["bkg_peak_sigma"].set(value=background_sigma, min=1e-6, max=max(0.8, peak_spec.window_deg))
+        params["bkg_peak_gamma"].set(value=background_gamma, min=1e-6, max=max(0.8, peak_spec.window_deg))
+    if "bkg_lin_slope" in params:
+        params["bkg_lin_slope"].set(value=slope)
+    if "bkg_lin_intercept" in params:
+        params["bkg_lin_intercept"].set(value=intercept)
 
     return params
 
 
 def fit_frame(frame: xr.DataArray, peak_spec: PeakSpec, candidate_center: float) -> dict[str, Any]:
-    fit_half_width = peak_spec.peak_only_window_deg or max(peak_spec.window_deg / 2, peak_spec.drift_tolerance_deg * 2)
+    fit_half_width = (
+        peak_spec.fitter.fit_half_width_deg
+        or peak_spec.peak_only_window_deg
+        or max(peak_spec.window_deg / 2, peak_spec.drift_tolerance_deg * 2)
+    )
     fit_data = local_window(frame, candidate_center, fit_half_width)
     if fit_data.sizes.get("twoTheta_deg", 0) < 4:
         raise RuntimeError("Fit window too small.")
@@ -392,7 +446,8 @@ def fit_frame(frame: xr.DataArray, peak_spec: PeakSpec, candidate_center: float)
     y_vals = fit_data.values
     bundle = build_model_bundle(peak_spec)
     params = initialize_params(bundle, x_vals, y_vals, peak_spec, candidate_center)
-    fit_res = bundle.model.fit(y_vals, params, x=x_vals, calc_covar=False)
+    fit_method = "least_squares" if bundle.fit_kind in {"voigt_exp", "double_voigt_linear"} else "leastsq"
+    fit_res = bundle.model.fit(y_vals, params, x=x_vals, method=fit_method, calc_covar=False, max_nfev=10000)
 
     if not fit_res.success:
         raise RuntimeError(f"Fit failed: {fit_res.message}")
@@ -419,6 +474,29 @@ def fit_frame(frame: xr.DataArray, peak_spec: PeakSpec, candidate_center: float)
         "integration_left": center - width / 2,
         "integration_right": center + width / 2,
         "fit_half_width": fit_half_width,
+        "fit_left": candidate_center - fit_half_width,
+        "fit_right": candidate_center + fit_half_width,
+    }
+
+
+def summarize_fit_quality(fit_res: Any) -> dict[str, float]:
+    data = np.asarray(fit_res.data, dtype=float)
+    residual = np.asarray(fit_res.residual, dtype=float)
+    ss_res = float(np.nansum(residual**2))
+    data_centered = data - float(np.nanmean(data)) if np.isfinite(np.nanmean(data)) else data
+    ss_tot = float(np.nansum(data_centered**2))
+    rmse = float(np.sqrt(np.nanmean(residual**2))) if residual.size else np.nan
+    data_scale = float(max(np.nanmax(np.abs(data)), np.nanstd(data), 1e-6)) if data.size else 1e-6
+    rel_rmse = float(rmse / data_scale) if np.isfinite(rmse) else np.nan
+    r2 = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else np.nan
+    quality_score = float(1.0 / (1.0 + rel_rmse)) if np.isfinite(rel_rmse) else np.nan
+    return {
+        "fit_chisqr": float(getattr(fit_res, "chisqr", np.nan)),
+        "fit_redchi": float(getattr(fit_res, "redchi", np.nan)),
+        "fit_rmse": rmse,
+        "fit_rel_rmse": rel_rmse,
+        "fit_r2": r2,
+        "fit_quality_score": quality_score,
     }
 
 
@@ -439,7 +517,7 @@ def integrate_peak(frame: xr.DataArray, fit_info: dict[str, Any]) -> dict[str, A
 
     fit_res = fit_info["fit_res"]
     comps = fit_res.eval_components(x=grid)
-    background_area = float(np.trapezoid(comps["bkg_"], grid)) if "bkg_" in comps else 0.0
+    background_area = float(np.trapezoid(np.sum([values for name, values in comps.items() if not name.startswith("peak_")], axis=0), grid)) if any(not name.startswith("peak_") for name in comps) else 0.0
     net_area = raw_area - background_area
 
     return {
@@ -485,9 +563,11 @@ def _save_fit_plot(run_dir: Path, frame: xr.DataArray, fit_info: dict[str, Any],
     right = float(fit_info.get("integration_right", float(frame.twoTheta_deg.max())))
     plot_left = left - margin_deg
     plot_right = right + margin_deg
-    grid = np.linspace(plot_left, plot_right, 512)
-    comps = fit_res.eval_components(x=grid)
-    total = fit_res.eval(x=grid)
+    fit_left = float(fit_info.get("fit_left", left))
+    fit_right = float(fit_info.get("fit_right", right))
+    fit_grid = np.linspace(fit_left, fit_right, 512)
+    comps = fit_res.eval_components(x=fit_grid)
+    total = fit_res.eval(x=fit_grid)
 
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
     # plot only the data within the focused window
@@ -499,15 +579,22 @@ def _save_fit_plot(run_dir: Path, frame: xr.DataArray, fit_info: dict[str, Any],
         x_data = frame.twoTheta_deg.values
         y_data = frame.values
     ax.plot(x_data, y_data, label="Data", color="#1f77b4")
-    ax.plot(grid, total, "--", color="#d62728", label="Fit")
+    ax.plot(fit_grid, total, "--", color="#d62728", label="Fit")
     if "peak_" in comps:
-        ax.plot(grid, comps["peak_"], ":", color="#ff7f0e", label="Peak")
-        ax.fill_between(grid, comps["peak_"], 0, where=(grid >= fit_info["integration_left"]) & (grid <= fit_info["integration_right"]), color="#ffdd99", alpha=0.6, label="Integrated Area")
-    if "bkg_" in comps:
-        ax.plot(grid, comps["bkg_"], "-.", color="#2ca02c", label="Background")
+        ax.plot(fit_grid, comps["peak_"], ":", color="#ff7f0e", label="Peak")
+        ax.fill_between(fit_grid, comps["peak_"], 0, where=(fit_grid >= fit_info["integration_left"]) & (fit_grid <= fit_info["integration_right"]), color="#ffdd99", alpha=0.6, label="Integrated Area")
+    background_index = 0
+    for name, values in comps.items():
+        if name.startswith("peak_"):
+            continue
+        label = "Background" if background_index == 0 else f"Background {background_index + 1}"
+        ax.plot(fit_grid, values, "-.", label=label)
+        background_index += 1
 
     ax.axvline(fit_info["integration_left"], linestyle="--", color="0.5", linewidth=1)
     ax.axvline(fit_info["integration_right"], linestyle="--", color="0.5", linewidth=1)
+    ax.axvline(fit_left, linestyle=":", color="0.4", linewidth=1)
+    ax.axvline(fit_right, linestyle=":", color="0.4", linewidth=1)
 
     best = fit_res.best_values
     amp = float(best.get("peak_amplitude", np.nan))
@@ -539,10 +626,6 @@ def _save_failed_fit_plot(run_dir: Path, frame: xr.DataArray, candidate_center: 
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     # show the data and mark candidate and center
-    left = float(candidate_center - margin_deg) if candidate_center is not None else float(frame.twoTheta_deg.min())
-    right = float(candidate_center + margin_deg) if candidate_center is not None else float(frame.twoTheta_deg.max())
-    grid = np.linspace(left, right, 512)
-
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
     ax.plot(frame.twoTheta_deg.values, frame.values, label="Data", color="#1f77b4")
     if candidate_center is not None:
@@ -590,6 +673,7 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
         fit_error: str | None = None
         fit_info: dict[str, Any] | None = None
         fit_status = "search" if not state.tracking_active else "track"
+        is_auto_key = False
 
         if candidate is None and state.last_center is not None:
             search_window = local_window(frame_corr, state.last_center, max(search_half_width, peak_spec.drift_tolerance_deg * 4))
@@ -650,10 +734,6 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
                     logger.exception("Failed to save failed-fit plot for configured key frame %s idx=%s", peak_spec.name, frame_index)
                 raise ValueError(f"No candidate peak found at configured key frame for peak {peak_spec.name} at frame {frame_index}")
 
-        # If earlier code didn't define is_auto_key (no candidate branch), default to False
-        if 'is_auto_key' not in locals():
-            is_auto_key = False
-
         row: dict[str, Any] = {
             "time": time_value,
             "frame_index": frame_index,
@@ -681,6 +761,12 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
             "fit_gamma": np.nan,
             "fit_slope": np.nan,
             "fit_offset": np.nan,
+            "fit_chisqr": np.nan,
+            "fit_redchi": np.nan,
+            "fit_rmse": np.nan,
+            "fit_rel_rmse": np.nan,
+            "fit_r2": np.nan,
+            "fit_quality_score": np.nan,
             "raw_y_max": float(np.nanmax(frame_corr.values)),
             "baseline_method": peak_spec.baseline_method or "none",
             "baseline_applied": baseline_da is not None,
@@ -692,6 +778,7 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
             try:
                 integration = integrate_peak(frame_corr, fit_info)
                 best = fit_info["fit_res"].best_values
+                quality = summarize_fit_quality(fit_info["fit_res"])
                 row.update(
                     {
                         "fit_success": True,
@@ -709,6 +796,7 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
                         "fit_gamma": float(best.get("peak_gamma", np.nan)),
                         "fit_slope": float(best.get("bkg_slope", 0.0)),
                         "fit_offset": float(best.get("bkg_intercept", best.get("bkg_c", 0.0))),
+                        **quality,
                     }
                 )
                 # Save a per-frame fit plot for key frames (human inspection)
@@ -771,6 +859,10 @@ def save_outputs(run_dir: Path, df_long: pd.DataFrame, config: RunConfig) -> Non
         "normalized_raw_area",
         "net_area",
         "normalized_net_area",
+        "fit_r2",
+        "fit_redchi",
+        "fit_rel_rmse",
+        "fit_quality_score",
         "background_area",
         "fit_center_deg",
         "integration_left_deg",

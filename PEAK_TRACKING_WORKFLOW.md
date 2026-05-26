@@ -2,6 +2,8 @@
 
 This project now includes a config-driven peak tracking workflow for GIWAXS time series.
 
+For a step-by-step record of how the current fitter and key-frame behavior were developed, see [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
+
 It replaces the older noisy integration path with a repeatable pipeline that:
 
 - tracks each peak frame by frame,
@@ -88,6 +90,7 @@ The long CSV includes:
 - expected center, candidate center, and fitted center,
 - fit success/status/message,
 - raw area, background area, and net area,
+- fit quality metrics: `fit_r2`, `fit_redchi`, `fit_rel_rmse`, `fit_quality_score`,
 - integration bounds,
 - normalization columns,
 - baseline and model metadata.
@@ -164,6 +167,7 @@ So the check is always local to the current frame's candidate, not a running tot
 - `min_prominence`: minimum prominence for candidate peak detection.
 - `baseline_method`: optional `pybaselines` method name.
 - `fitter`: model selection or custom factory hook.
+- `peak_only_window_deg`: if set, overrides the fit half-width derived from `window_deg` for all fitters.
 
 ## Built-in fitter kinds
 
@@ -171,9 +175,29 @@ The workflow includes a small registry of built-in model bundles:
 
 - `voigt_linear`
 - `voigt_constant`
+- `voigt_exp`
 - `gaussian_linear`
 - `pseudo_voigt_linear`
+- `double_voigt_linear`
 - `voigt`
+
+For ClMBAI, `voigt_exp` with `fit_half_width_deg: 0.4` gives excellent results (fit_r2 > 0.984 across all key frames) by keeping the exponential background model away from the steepest part of the low-angle shoulder.
+
+### Fitter options
+
+Each built-in fitter accepts these optional keys in its dict:
+
+| Key | Type | Description |
+|---|---|---|
+| `kind` | str | One of the built-in fitter names above (default: `voigt_linear`) |
+| `fit_half_width_deg` | float | **Fit window half-width in degrees.** Overrides the auto-computed value (`window_deg / 2`). Use a narrower value to exclude background features that are outside the peak region. For ClMBAI 2D (002), `0.4` works well to keep the ~4.75° shoulder out of the fit. |
+| `kwargs` | dict | Fitter-specific keyword arguments (e.g., `background_peak_center_deg` for `double_voigt_linear`) |
+
+Priority order for fit window: `fitter.fit_half_width_deg` → `peak_only_window_deg` → `max(window_deg / 2, drift_tolerance_deg * 2)`.
+
+### Peak amplitude initialization note
+
+lmfit's `VoigtModel.amplitude` is the profile **area** (integral), not the peak height. The workflow initializes it as `peak_height × π × gamma_init` so the starting model height matches the observed data peak. Initializing it as a raw height value caused the optimizer to start ~8× too high and land in a bad local minimum with artificially low amplitude and inflated background.
 
 ## Custom model hook
 
