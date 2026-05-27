@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import json
 import logging
 import math
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,12 +22,41 @@ from lmfit.models import ConstantModel, GaussianModel, LinearModel, PseudoVoigtM
 from scipy.signal import find_peaks, peak_prominences
 from tqdm import tqdm
 
-from peak_tracking_config import DEFAULT_OUTPUT_ROOT, RUN_CONFIGS
 from vogit_width import voigt_width_at_height
 
 
 DEFAULT_WAVELENGTH_A = 1.5418
 logger = logging.getLogger(__name__)
+
+
+def load_config_module(config_path: Path) -> tuple[Path, dict[str, Any]]:
+    """
+    Dynamically load a peak tracking configuration module.
+    
+    Args:
+        config_path: Path to the config .py file
+    
+    Returns:
+        (DEFAULT_OUTPUT_ROOT, RUN_CONFIGS) tuple
+    """
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    spec = importlib.util.spec_from_file_location("peak_tracking_config_dynamic", config_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load config from {config_path}")
+    
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["peak_tracking_config_dynamic"] = module
+    spec.loader.exec_module(module)
+    
+    if not hasattr(module, "RUN_CONFIGS"):
+        raise AttributeError(f"Config file {config_path} must define RUN_CONFIGS")
+    
+    default_output_root = getattr(module, "DEFAULT_OUTPUT_ROOT", Path("output"))
+    run_configs = getattr(module, "RUN_CONFIGS")
+    
+    return Path(default_output_root), dict(run_configs)
 
 
 @dataclass(frozen=True)
@@ -57,6 +88,15 @@ class PeakSpec:
     baseline_kwargs: dict[str, Any] = field(default_factory=dict)
     peak_only_window_deg: float | None = None
     auto_keyframe_every: int | None = 15
+    # Peak presence validation
+    min_snr: float = 3.0  # Minimum signal-to-noise ratio to consider peak present
+    validate_fit_quality: bool = True  # Enable post-fit validation
+    # Adaptive parameter bounds
+    use_adaptive_bounds: bool = False  # Enable adaptive parameter constraints
+    adaptive_sigma_tolerance: float = 0.5  # Allowed fractional change in sigma/gamma (50%)
+    adaptive_amplitude_tolerance: float = 0.5  # Allowed fractional change in amplitude (50%)
+    adaptive_min_consecutive: int = 5  # Consecutive successful fits before enabling adaptive bounds
+    fallback_on_validation_failure: bool = True  # Retry with wide bounds if validation fails
 
 
 @dataclass(frozen=True)
@@ -65,7 +105,7 @@ class RunConfig:
     da_file: Path
     peaks: list[PeakSpec]
     global_shift_deg: float = 0.0
-    output_root: Path = DEFAULT_OUTPUT_ROOT
+    output_root: Path = field(default_factory=lambda: Path("output"))
     baseline_method: str | None = None
     baseline_kwargs: dict[str, Any] = field(default_factory=dict)
     wavelength_a: float = DEFAULT_WAVELENGTH_A
@@ -82,8 +122,13 @@ class FitBundle:
 @dataclass
 class TrackingState:
     last_center: float | None = None
+    last_sigma: float | None = None
+    last_gamma: float | None = None
+    last_amplitude: float | None = None
     tracking_active: bool = False
     lost_count: int = 0
+    consecutive_good_fits: int = 0  # Count for enabling adaptive bounds
+    peak_present: bool = True  # Track if peak is physically present vs fit failure
 
 
 def configure_logging(run_dir: Path) -> None:
@@ -188,6 +233,14 @@ def normalize_peak_entries(entries: Iterable[Any]) -> list[PeakSpec]:
                     baseline_kwargs=dict(entry.get("baseline_kwargs", {})),
                     peak_only_window_deg=entry.get("peak_only_window_deg"),
                     auto_keyframe_every=entry.get("auto_keyframe_every", 15),
+                    # Validation & adaptive bounds parameters
+                    min_snr=float(entry.get("min_snr", 3.0)),
+                    validate_fit_quality=bool(entry.get("validate_fit_quality", True)),
+                    use_adaptive_bounds=bool(entry.get("use_adaptive_bounds", False)),
+                    adaptive_sigma_tolerance=float(entry.get("adaptive_sigma_tolerance", 0.5)),
+                    adaptive_amplitude_tolerance=float(entry.get("adaptive_amplitude_tolerance", 0.5)),
+                    adaptive_min_consecutive=int(entry.get("adaptive_min_consecutive", 5)),
+                    fallback_on_validation_failure=bool(entry.get("fallback_on_validation_failure", True)),
                 )
             )
             continue
@@ -220,6 +273,14 @@ def normalize_peak_entries(entries: Iterable[Any]) -> list[PeakSpec]:
                     baseline_kwargs=dict(extras.get("baseline_kwargs", {})),
                     peak_only_window_deg=extras.get("peak_only_window_deg"),
                     auto_keyframe_every=extras.get("auto_keyframe_every", 15),
+                    # Validation & adaptive bounds parameters
+                    min_snr=float(extras.get("min_snr", 3.0)),
+                    validate_fit_quality=bool(extras.get("validate_fit_quality", True)),
+                    use_adaptive_bounds=bool(extras.get("use_adaptive_bounds", False)),
+                    adaptive_sigma_tolerance=float(extras.get("adaptive_sigma_tolerance", 0.5)),
+                    adaptive_amplitude_tolerance=float(extras.get("adaptive_amplitude_tolerance", 0.5)),
+                    adaptive_min_consecutive=int(extras.get("adaptive_min_consecutive", 5)),
+                    fallback_on_validation_failure=bool(extras.get("fallback_on_validation_failure", True)),
                 )
             )
             continue
@@ -229,13 +290,27 @@ def normalize_peak_entries(entries: Iterable[Any]) -> list[PeakSpec]:
     return normalized
 
 
-def normalize_run_config(name: str, config: dict[str, Any]) -> RunConfig:
+def normalize_run_config(name: str, config: dict[str, Any], default_output_root: Path | None = None) -> RunConfig:
+    """
+    Normalize a run config dictionary into a RunConfig object.
+    
+    Args:
+        name: Name of the run
+        config: Config dictionary
+        default_output_root: Default output root if not specified in config
+    
+    Returns:
+        RunConfig object
+    """
+    if default_output_root is None:
+        default_output_root = Path("output")
+    
     return RunConfig(
         name=name,
         da_file=Path(config["da_file"]),
         peaks=normalize_peak_entries(config["peaks"]),
         global_shift_deg=float(config.get("global_shift_deg", 0.0)),
-        output_root=Path(config.get("output_root", DEFAULT_OUTPUT_ROOT)),
+        output_root=Path(config.get("output_root", default_output_root)),
         baseline_method=config.get("baseline_method"),
         baseline_kwargs=dict(config.get("baseline_kwargs", {})),
         wavelength_a=float(config.get("wavelength_a", DEFAULT_WAVELENGTH_A)),
@@ -298,6 +373,99 @@ def choose_candidate(
     }
 
 
+def check_peak_presence(window_data: xr.DataArray, min_snr: float = 3.0) -> tuple[bool, str, float]:
+    """
+    Stage 1 validation: Check BEFORE fitting if a real peak exists above noise.
+    
+    Args:
+        window_data: Data window to check for peak presence
+        min_snr: Minimum signal-to-noise ratio required
+    
+    Returns:
+        (has_peak: bool, reason: str, snr: float)
+    """
+    y_vals = window_data.values
+    finite_mask = np.isfinite(y_vals)
+    y_clean = y_vals[finite_mask]
+    
+    if len(y_clean) < 3:
+        return False, "Insufficient data points", 0.0
+    
+    # Estimate baseline and noise from lower percentiles
+    baseline = float(np.percentile(y_clean, 10))  # Bottom 10% as baseline
+    noise = float(np.std(y_clean[y_clean < np.percentile(y_clean, 25)]))
+    
+    # Find maximum signal
+    peak_max = float(np.max(y_clean))
+    
+    # Calculate SNR
+    snr = (peak_max - baseline) / noise if noise > 1e-6 else 0.0
+    
+    if snr < min_snr:
+        return False, f"SNR={snr:.2f} below threshold {min_snr}", snr
+    
+    return True, "Peak detected", snr
+
+
+def validate_fit_quality(
+    fit_res: Any,
+    peak_spec: PeakSpec,
+    window_data: xr.DataArray,
+) -> tuple[bool, str]:
+    """
+    Stage 2 validation: Check AFTER fitting if result represents a real peak.
+    
+    Rejects fits where:
+    - Sigma/gamma hit parameter bounds (optimizer struggling)
+    - Amplitude is essentially zero (fitting noise)
+    - Peak height is much smaller than data range (weak/absent peak)
+    - Fit quality is poor (high reduced chi-square)
+    
+    Args:
+        fit_res: lmfit fit result object
+        peak_spec: Peak specification with constraints
+        window_data: Original data window used for fitting
+    
+    Returns:
+        (is_valid: bool, reason: str)
+    """
+    best = fit_res.best_values
+    
+    # 1. Check if sigma hit bounds → optimizer struggling
+    sigma = float(best.get("peak_sigma", 0))
+    _fit_hw = peak_spec.fitter.fit_half_width_deg
+    effective_window = min(peak_spec.window_deg, 2 * _fit_hw) if _fit_hw else peak_spec.window_deg
+    sigma_floor = max(0.01, effective_window / 50)
+    sigma_ceiling = max(effective_window, peak_spec.drift_tolerance_deg * 4)
+    
+    if sigma <= sigma_floor * 1.05:
+        return False, f"Sigma at lower bound: {sigma:.4f} ≤ {sigma_floor*1.05:.4f}"
+    if sigma >= sigma_ceiling * 0.95:
+        return False, f"Sigma at upper bound: {sigma:.4f} ≥ {sigma_ceiling*0.95:.4f}"
+    
+    # 2. Check if amplitude is essentially zero
+    amplitude = float(best.get("peak_amplitude", 0))
+    if amplitude < 1e-4:
+        return False, f"Amplitude near zero: {amplitude:.6f}"
+    
+    # 3. Check peak height relative to data scale
+    gamma = float(best.get("peak_gamma", 1))
+    # For Voigt: approximate height = amplitude / (π * gamma)
+    peak_height = amplitude / (np.pi * gamma) if gamma > 1e-6 else 0
+    data_vals = window_data.values[np.isfinite(window_data.values)]
+    if len(data_vals) > 0:
+        data_max = float(np.max(data_vals))
+        if peak_height < data_max * 0.05:  # Peak < 5% of max signal
+            return False, f"Peak too weak: height={peak_height:.3f} vs data_max={data_max:.3f}"
+    
+    # 4. Check fit quality (if available)
+    if hasattr(fit_res, "redchi") and np.isfinite(fit_res.redchi):
+        if fit_res.redchi > 20:
+            return False, f"Poor fit quality: redchi={fit_res.redchi:.2f}"
+    
+    return True, "Valid fit"
+
+
 def _linear_background_guess(x_vals: np.ndarray, y_vals: np.ndarray) -> tuple[float, float]:
     if len(x_vals) < 2:
         return 0.0, float(np.nanmedian(y_vals) if len(y_vals) else 0.0)
@@ -353,7 +521,24 @@ def initialize_params(
     y_vals: np.ndarray,
     peak_spec: PeakSpec,
     candidate_center: float,
+    previous_params: dict[str, float | None] | None = None,
+    use_adaptive: bool = False,
 ) -> Any:
+    """
+    Initialize fit parameters with optional adaptive bounds based on previous fit.
+    
+    Args:
+        bundle: FitBundle with model
+        x_vals: x-coordinates for fitting
+        y_vals: y-values for fitting
+        peak_spec: Peak specification
+        candidate_center: Estimated peak center
+        previous_params: Previous fit parameters (sigma, gamma, amplitude) for adaptive bounds
+        use_adaptive: Whether to apply adaptive bounds (requires previous_params)
+    
+    Returns:
+        lmfit Parameters object
+    """
     params = bundle.model.make_params()
     finite_mask = np.isfinite(y_vals)
     x_vals = np.asarray(x_vals[finite_mask], dtype=float)
@@ -381,21 +566,51 @@ def initialize_params(
     # model height close to the data peak and avoids the optimizer starting from
     # an amplitude value that is ~8x too large.
     amplitude_init = peak_height * np.pi * gamma_init
-    params["peak_amplitude"].set(value=amplitude_init, min=1e-6)
+    
+    # ADAPTIVE BOUNDS: Use previous fit parameters if available and enabled
+    if use_adaptive and previous_params and "sigma" in previous_params and "gamma" in previous_params:
+        prev_sigma_val = previous_params["sigma"]
+        prev_gamma_val = previous_params["gamma"]
+        prev_amplitude_val = previous_params.get("amplitude")
+        
+        # Only proceed if we have valid float values (not None)
+        if prev_sigma_val is not None and prev_gamma_val is not None:
+            prev_sigma = float(prev_sigma_val)
+            prev_gamma = float(prev_gamma_val)
+            prev_amplitude = float(prev_amplitude_val) if prev_amplitude_val is not None else amplitude_init
+            
+            # Sigma bounds: previous ± tolerance, but respect floor/ceiling
+            sigma_tolerance = peak_spec.adaptive_sigma_tolerance
+            sigma_min_adaptive = max(sigma_floor, prev_sigma * (1 - sigma_tolerance))
+            sigma_max_adaptive = min(sigma_ceiling, prev_sigma * (1 + sigma_tolerance))
+            
+            # Gamma bounds: similar logic
+            gamma_min_adaptive = max(sigma_floor, prev_gamma * (1 - sigma_tolerance))
+            gamma_max_adaptive = min(sigma_ceiling, prev_gamma * (1 + sigma_tolerance))
+            
+            # Amplitude bounds: previous ± tolerance
+            amp_tolerance = peak_spec.adaptive_amplitude_tolerance
+            amp_min_adaptive = max(1e-6, prev_amplitude * (1 - amp_tolerance))
+            amp_max_adaptive = prev_amplitude * (1 + amp_tolerance)
+            
+            params["peak_amplitude"].set(value=prev_amplitude, min=amp_min_adaptive, max=amp_max_adaptive)
+            params["peak_sigma"].set(value=prev_sigma, min=sigma_min_adaptive, max=sigma_max_adaptive)
+            params["peak_gamma"].set(value=prev_gamma, min=gamma_min_adaptive, max=gamma_max_adaptive)
+        else:
+            # Fallback to wide bounds if values are None
+            params["peak_amplitude"].set(value=amplitude_init, min=1e-6)
+            params["peak_sigma"].set(value=gamma_init, min=sigma_floor, max=sigma_ceiling)
+            params["peak_gamma"].set(value=gamma_init, min=sigma_floor, max=sigma_ceiling)
+    else:
+        # Wide bounds (original behavior)
+        params["peak_amplitude"].set(value=amplitude_init, min=1e-6)
+        params["peak_sigma"].set(value=gamma_init, min=sigma_floor, max=sigma_ceiling)
+        params["peak_gamma"].set(value=gamma_init, min=sigma_floor, max=sigma_ceiling)
+    
     params["peak_center"].set(
         value=candidate_center,
         min=candidate_center - peak_spec.drift_tolerance_deg,
         max=candidate_center + peak_spec.drift_tolerance_deg,
-    )
-    params["peak_sigma"].set(
-        value=gamma_init,
-        min=sigma_floor,
-        max=sigma_ceiling,
-    )
-    params["peak_gamma"].set(
-        value=gamma_init,
-        min=sigma_floor,
-        max=sigma_ceiling,
     )
 
     if "peak_fraction" in params:
@@ -439,7 +654,26 @@ def initialize_params(
     return params
 
 
-def fit_frame(frame: xr.DataArray, peak_spec: PeakSpec, candidate_center: float) -> dict[str, Any]:
+def fit_frame(
+    frame: xr.DataArray,
+    peak_spec: PeakSpec,
+    candidate_center: float,
+    previous_params: dict[str, float | None] | None = None,
+    use_adaptive: bool = False,
+) -> dict[str, Any]:
+    """
+    Fit a peak in a single frame with optional adaptive parameter bounds.
+    
+    Args:
+        frame: Data array for this frame
+        peak_spec: Peak specification
+        candidate_center: Estimated peak center
+        previous_params: Previous fit parameters for adaptive bounds
+        use_adaptive: Whether to use adaptive bounds
+    
+    Returns:
+        Dictionary with fit results and integration bounds
+    """
     fit_half_width = (
         peak_spec.fitter.fit_half_width_deg
         or peak_spec.peak_only_window_deg
@@ -452,7 +686,10 @@ def fit_frame(frame: xr.DataArray, peak_spec: PeakSpec, candidate_center: float)
     x_vals = fit_data.twoTheta_deg.values
     y_vals = fit_data.values
     bundle = build_model_bundle(peak_spec)
-    params = initialize_params(bundle, x_vals, y_vals, peak_spec, candidate_center)
+    params = initialize_params(
+        bundle, x_vals, y_vals, peak_spec, candidate_center,
+        previous_params=previous_params, use_adaptive=use_adaptive
+    )
     fit_method = "least_squares" if bundle.fit_kind in {"voigt_exp", "double_voigt_linear"} else "leastsq"
     fit_res = bundle.model.fit(y_vals, params, x=x_vals, method=fit_method, calc_covar=False, max_nfev=10000)
 
@@ -650,7 +887,13 @@ def _save_failed_fit_plot(run_dir: Path, frame: xr.DataArray, candidate_center: 
 def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, global_shift_deg: float = 0.0, keyframe_plot_margin_deg: float = 5.0) -> list[dict[str, Any]]:
     times = series.time.values
     frames = frame_indices_for_peak(peak_spec, len(times))
-    state = TrackingState(last_center=peak_spec.center_deg, tracking_active=False, lost_count=0)
+    state = TrackingState(
+        last_center=peak_spec.center_deg,
+        tracking_active=False,
+        lost_count=0,
+        consecutive_good_fits=0,
+        peak_present=True,
+    )
     rows: list[dict[str, Any]] = []
     auto_key_frames: list[int] = []
     first_detected = False
@@ -668,12 +911,20 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
             # manual force reset: drop current tracking and anchor search to configured center
             state.tracking_active = False
             state.last_center = peak_spec.center_deg
+            state.last_sigma = None
+            state.last_gamma = None
+            state.last_amplitude = None
             state.lost_count = 0
+            state.consecutive_good_fits = 0
             prev_was_lost = True
 
         search_anchor = state.last_center if state.last_center is not None else peak_spec.center_deg
         search_half_width = max(peak_spec.window_deg / 2, peak_spec.reacquire_window_deg or peak_spec.drift_tolerance_deg * 3)
         search_window = local_window(frame_corr, search_anchor, search_half_width)
+        
+        # STAGE 1: PRE-FIT VALIDATION - Check for peak presence
+        has_peak, presence_reason, peak_snr = check_peak_presence(search_window, min_snr=peak_spec.min_snr)
+        
         candidate = choose_candidate(search_window, search_anchor, min_prominence=peak_spec.min_prominence)
 
         fit_success = False
@@ -681,19 +932,106 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
         fit_info: dict[str, Any] | None = None
         fit_status = "search" if not state.tracking_active else "track"
         is_auto_key = False
+        validation_reason: str | None = None
+        used_adaptive_bounds = False
 
-        if candidate is None and state.last_center is not None:
+        # If no peak detected by SNR check, mark as peak_absent
+        if not has_peak:
+            fit_error = f"Peak absent: {presence_reason}"
+            fit_status = "peak_absent"
+            state.tracking_active = False
+            state.peak_present = False
+            state.lost_count += 1
+            prev_was_lost = True
+            # No need to save plot or raise for SNR failures - the SNR value in CSV is sufficient diagnostic
+            # Plot generation is expensive and there's nothing useful to visualize if SNR check fails
+            if is_config_key:
+                logger.warning(
+                    "Peak absent (SNR check failed) at configured key frame for peak %s at frame %s: %s (SNR=%.2f)",
+                    peak_spec.name, frame_index, presence_reason, peak_snr
+                )
+        
+        elif candidate is None and state.last_center is not None:
+            # Try expanded search window
             search_window = local_window(frame_corr, state.last_center, max(search_half_width, peak_spec.drift_tolerance_deg * 4))
             candidate = choose_candidate(search_window, state.last_center, min_prominence=peak_spec.min_prominence)
 
-        if candidate is not None:
+        if candidate is not None and has_peak:
+            # Determine if we should use adaptive bounds
+            use_adaptive = (
+                peak_spec.use_adaptive_bounds
+                and state.consecutive_good_fits >= peak_spec.adaptive_min_consecutive
+                and state.last_sigma is not None
+                and state.last_gamma is not None
+                and state.last_amplitude is not None
+            )
+            
+            previous_params = None
+            if use_adaptive:
+                previous_params = {
+                    "sigma": state.last_sigma,
+                    "gamma": state.last_gamma,
+                    "amplitude": state.last_amplitude,
+                }
+                used_adaptive_bounds = True
+            
             try:
-                fit_info = fit_frame(frame_corr, peak_spec, candidate["center"])
+                # Attempt fitting with adaptive bounds if enabled
+                fit_info = fit_frame(
+                    frame_corr, peak_spec, candidate["center"],
+                    previous_params=previous_params,
+                    use_adaptive=use_adaptive
+                )
+                
+                # STAGE 2: POST-FIT VALIDATION - Check fit quality
+                if peak_spec.validate_fit_quality:
+                    is_valid, validation_reason = validate_fit_quality(
+                        fit_info["fit_res"], peak_spec, search_window
+                    )
+                    
+                    if not is_valid:
+                        # Validation failed - try fallback if enabled
+                        if use_adaptive and peak_spec.fallback_on_validation_failure:
+                            logger.debug(
+                                "Fit validation failed with adaptive bounds for %s idx=%s (%s), retrying with wide bounds",
+                                peak_spec.name, frame_index, validation_reason
+                            )
+                            # Retry with wide bounds
+                            fit_info = fit_frame(
+                                frame_corr, peak_spec, candidate["center"],
+                                previous_params=None,
+                                use_adaptive=False
+                            )
+                            used_adaptive_bounds = False
+                            # Re-validate
+                            is_valid, validation_reason = validate_fit_quality(
+                                fit_info["fit_res"], peak_spec, search_window
+                            )
+                        
+                        if not is_valid:
+                            # Still invalid after fallback
+                            fit_error = f"Fit validation failed: {validation_reason}"
+                            fit_status = "fit_invalid"
+                            state.tracking_active = False
+                            state.consecutive_good_fits = 0
+                            state.lost_count += 1
+                            prev_was_lost = True
+                            raise RuntimeError(fit_error)
+                
+                # Fit succeeded and passed validation
                 fit_success = True
                 fit_status = "track" if state.tracking_active else "search"
+                
+                # Update tracking state with fitted parameters
                 state.last_center = float(fit_info["fit_center"])
+                best = fit_info["fit_res"].best_values
+                state.last_sigma = float(best.get("peak_sigma", state.last_sigma or 0.05))
+                state.last_gamma = float(best.get("peak_gamma", state.last_gamma or 0.05))
+                state.last_amplitude = float(best.get("peak_amplitude", state.last_amplitude or 1.0))
                 state.tracking_active = True
+                state.peak_present = True
                 state.lost_count = 0
+                state.consecutive_good_fits += 1
 
                 # Auto key-frame logic
                 is_auto_key = False
@@ -719,6 +1057,7 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
             except Exception as exc:
                 fit_error = str(exc)
                 state.tracking_active = False
+                state.consecutive_good_fits = 0
                 state.lost_count += 1
                 prev_was_lost = True
                 # If this was a user-configured key frame, save diagnostic and raise — user provided explicit frame
@@ -728,9 +1067,11 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
                     except Exception:
                         logger.exception("Failed to save failed-fit plot for configured key frame %s idx=%s", peak_spec.name, frame_index)
                     raise ValueError(f"Configured key frame failed to fit for peak {peak_spec.name} at frame {frame_index}: {exc}")
-        else:
+        elif candidate is None:
             fit_error = "No candidate peak found"
+            fit_status = "no_candidate"
             state.tracking_active = False
+            state.consecutive_good_fits = 0
             state.lost_count += 1
             prev_was_lost = True
             # If no candidate on a user-configured key frame, save diagnostic and raise
@@ -779,6 +1120,12 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
             "baseline_applied": baseline_da is not None,
             "fit_error": fit_error,
             "reacquire_anchor_deg": search_anchor,
+            # New validation and adaptive bounds fields
+            "peak_snr": peak_snr if has_peak else 0.0,
+            "peak_presence_check": "passed" if has_peak else "failed",
+            "validation_reason": validation_reason,
+            "used_adaptive_bounds": used_adaptive_bounds,
+            "consecutive_good_fits": state.consecutive_good_fits,
         }
 
         if fit_success and fit_info is not None:
@@ -985,17 +1332,29 @@ def run_peak_tracking(config: RunConfig) -> tuple[pd.DataFrame, Path]:
     return df, run_dir
 
 
-def build_run_config_from_name(name: str, output_root: Path | None = None) -> RunConfig:
-    if name not in RUN_CONFIGS:
+def build_run_config_from_name(name: str, run_configs: dict[str, Any], default_output_root: Path, output_root: Path | None = None) -> RunConfig:
+    """
+    Build a RunConfig from a preset name in the config dictionary.
+    
+    Args:
+        name: Name of the run preset
+        run_configs: RUN_CONFIGS dictionary from the config file
+        default_output_root: DEFAULT_OUTPUT_ROOT from the config file
+        output_root: Optional override for output root
+    
+    Returns:
+        RunConfig object
+    """
+    if name not in run_configs:
         raise KeyError(f"Unknown run preset: {name}")
 
-    raw = RUN_CONFIGS[name]
+    raw = run_configs[name]
     config = RunConfig(
         name=name,
         da_file=Path(raw["da_file"]),
         peaks=normalize_peak_entries(raw["peaks"]),
         global_shift_deg=float(raw.get("global_shift_deg", 0.0)),
-        output_root=Path(output_root) if output_root is not None else DEFAULT_OUTPUT_ROOT,
+        output_root=Path(output_root) if output_root is not None else default_output_root,
         baseline_method=raw.get("baseline_method"),
         baseline_kwargs=dict(raw.get("baseline_kwargs", {})),
         wavelength_a=float(raw.get("wavelength_a", DEFAULT_WAVELENGTH_A)),
@@ -1004,17 +1363,18 @@ def build_run_config_from_name(name: str, output_root: Path | None = None) -> Ru
     return config
 
 
-def list_run_presets() -> None:
-    for key, value in RUN_CONFIGS.items():
+def list_run_presets(run_configs: dict[str, Any]) -> None:
+    """List all available run presets from the config dictionary."""
+    for key, value in run_configs.items():
         print(f"{key}: {value['da_file']}")
 
 
-def _run_one(name: str, output_root: Path, retries: int = 3) -> tuple[str, int, Path]:
+def _run_one(name: str, run_configs: dict[str, Any], default_output_root: Path, output_root: Path, retries: int = 3) -> tuple[str, int, Path]:
     """Run a single preset and return (name, row_count, run_dir). Retries on failure."""
     last_exc: BaseException | None = None
     for attempt in range(1, retries + 1):
         try:
-            config = build_run_config_from_name(name, output_root=output_root)
+            config = build_run_config_from_name(name, run_configs, default_output_root, output_root=output_root)
             df, run_dir = run_peak_tracking(config)
             return name, len(df), run_dir
         except Exception as exc:
@@ -1025,26 +1385,41 @@ def _run_one(name: str, output_root: Path, retries: int = 3) -> tuple[str, int, 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Peak tracking and integration workflow")
+    parser.add_argument(
+        "--config", 
+        type=Path, 
+        default=Path(__file__).parent / "peak_tracking_config.py",
+        help="Path to peak tracking config file (default: peak_tracking_config.py in same directory)"
+    )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--run", choices=sorted(RUN_CONFIGS.keys()), help="Run a single preset")
-    group.add_argument("--run-all", action="store_true", help="Run all presets in RUN_CONFIGS in parallel")
+    group.add_argument("--run", help="Run a single preset (name from config)")
+    group.add_argument("--run-all", action="store_true", help="Run all presets in config in parallel")
     parser.add_argument("--list-runs", action="store_true", help="List available run presets")
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Override output root")
+    parser.add_argument("--output-root", type=Path, help="Override output root")
     parser.add_argument(
         "--jobs", type=int, default=-1,
         help="Number of parallel jobs for --run-all (default: -1 = all CPU cores)",
     )
     args = parser.parse_args()
 
+    # Load config file
+    try:
+        default_output_root, run_configs = load_config_module(args.config)
+    except Exception as exc:
+        print(f"Error loading config file {args.config}: {exc}", file=sys.stderr)
+        return 1
+
+    output_root = args.output_root if args.output_root else default_output_root
+
     if args.list_runs:
-        list_run_presets()
+        list_run_presets(run_configs)
         return 0
 
     if args.run_all:
-        names = sorted(RUN_CONFIGS.keys())
+        names = sorted(run_configs.keys())
         print(f"Running {len(names)} presets with {args.jobs} workers...")
         results = joblib.Parallel(n_jobs=args.jobs, backend="loky", verbose=10)(
-            joblib.delayed(_run_one)(name, args.output_root) for name in names
+            joblib.delayed(_run_one)(name, run_configs, default_output_root, output_root) for name in names
         )
         for name, nrows, run_dir in results:
             print(f"  {name}: {nrows} rows -> {run_dir}")
@@ -1053,7 +1428,7 @@ def main() -> int:
     if not args.run:
         parser.error("--run or --run-all is required unless --list-runs is used")
 
-    config = build_run_config_from_name(args.run, output_root=args.output_root)
+    config = build_run_config_from_name(args.run, run_configs, default_output_root, output_root=output_root)
     df, run_dir = run_peak_tracking(config)
     print(f"Saved {len(df)} rows to {run_dir}")
     return 0
