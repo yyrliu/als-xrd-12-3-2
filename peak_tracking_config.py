@@ -1,3 +1,32 @@
+"""Peak tracking run configurations for the Yi-Ru Feb 2026 ALS beamtime.
+
+This module is loaded dynamically by ``peak_tracking_workflow.py``. It must
+define:
+
+- ``DEFAULT_OUTPUT_ROOT`` (Path): Default directory for output folders.
+- ``RUN_CONFIGS`` (dict[str, dict]): Mapping of run name → config dict.
+
+Each config dict accepts the keys documented in :class:`RunConfig` and
+:class:`PeakSpec`. Peaks can be supplied as tuples of the form::
+
+    (center_deg, window_deg, (start_idx, stop_idx), name, extras_dict)
+
+or as plain dicts matching :class:`PeakSpec` field names.
+
+Usage::
+
+    uv run python peak_tracking_workflow.py --config peak_tracking_config.py --list-runs
+    uv run python peak_tracking_workflow.py --config peak_tracking_config.py --run insitu_0.5M_MeOMBAI
+
+See PEAK_TRACKING_GUIDE.md for a complete parameter reference.
+
+Notes on session calibration
+-----------------------------
+Files from the **260214 session** used a different poni file (``manual_calib.poni``),
+which shifts all 2\u03b8 positions by ~0.94\u00d7 relative to the standard calibration.
+Those runs use ``_260214_peaks()`` helpers with corrected center values; all other
+runs use the standard ``_*_peaks()`` helpers.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +38,12 @@ DEFAULT_OUTPUT_ROOT = Path(
 
 
 def _mabai_peaks() -> list[tuple]:
+    """Peak list for MBAI (methylammonium bismuth ammonium iodide) samples.
+
+    Covers: 2D (002) perovskite, 1D (002), PbI2, and ITO substrate peaks.
+    The 2D (002) peak uses a ``voigt_exp`` fitter with a narrow fit window
+    (0.4°) to avoid the exponential background tail biasing the fit.
+    """
     return [
         (7.23, 2, (-1, 0), "2D (002)", {
             "drift_tolerance_deg": 0.05,
@@ -21,6 +56,12 @@ def _mabai_peaks() -> list[tuple]:
 
 
 def _meombai_peaks() -> list[tuple]:
+    """Peak list for MeOMBAI (methoxy-methylbutylammonium iodide) samples.
+
+    MeOMBAI appears as a weak, intermittent peak at ~6.8° that may be absent
+    for extended periods. Validation is important; adaptive bounds are not
+    recommended for this peak.
+    """
     return [
         (6.0, 0.5, (-1, 0), "2D (002)", {"drift_tolerance_deg": 0.15}),
         (13.3, 2.0, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),
@@ -29,6 +70,13 @@ def _meombai_peaks() -> list[tuple]:
     ]
 
 def _clmbai_peaks() -> list[tuple]:
+    """Peak list for ClMBAI (chloro-methylbutylammonium iodide) samples.
+
+    ClMBAI appears at ~7.3° and is similarly weak and intermittent to MeOMBAI.
+    The 2D (002) peak uses a ``voigt_exp`` fitter to handle the background tail.
+    Frame range for 2D (002) is restricted to frames -1 through 25 (backwards)
+    where the peak is well-formed before being obscured by the growing 3D phase.
+    """
     return [
         (6.4, 1, (-1, 25), "2D (002)", {
             "drift_tolerance_deg": 0.05,
@@ -41,9 +89,13 @@ def _clmbai_peaks() -> list[tuple]:
 
 
 def _clmbai_260214_peaks() -> list[tuple]:
-    # Files from 260214 session (manual_calib.poni) have a slightly different
-    # q→2θ mapping: the 2D (002) peak lands at ~5.79° instead of ~6.4°.
-    # Other peaks scaled accordingly; ClMBAI/PbI2/ITO positions are approximate.
+    """Peak list for ClMBAI samples from the 260214 calibration session.
+
+    The 260214 session used ``manual_calib.poni``, which shifts all peaks to
+    approximately 0.904× of their standard 2θ values. The 2D (002) peak lands
+    at ~5.79° instead of the usual ~6.4°. The ITO substrate also shifts from
+    30.3° to ~27.4°.
+    """
     return [
         (5.79, 1, (-1, 25), "2D (002)", {
             "drift_tolerance_deg": 0.05,
@@ -56,8 +108,12 @@ def _clmbai_260214_peaks() -> list[tuple]:
 
 
 def _meombai_260214_peaks() -> list[tuple]:
-    # Files from 260214 session (manual_calib.poni): 2D (002) peak at ~5.64°
-    # instead of ~6.0°; other peaks scaled by the same factor (~0.94).
+    """Peak list for MeOMBAI samples from the 260214 calibration session.
+
+    Same 0.904× scaling as :func:`_clmbai_260214_peaks`. The 2D (002) peak
+    is at ~5.64° and the MeOMBAI peak at ~6.38°. ITO is not included because
+    it falls outside the reliable 2θ range for this calibration.
+    """
     return [
         (5.64, 0.5, (-1, 0), "2D (002)", {"drift_tolerance_deg": 0.15}),
         (12.5, 2.0, (0, -1), "PbI2", {"drift_tolerance_deg": 0.05}),

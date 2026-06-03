@@ -1,235 +1,93 @@
 # Development Log
 
-## 2026-05-26: Major Enhancement - Two-Stage Validation & Adaptive Parameter Bounds
+## 2026-05-26: Two-Stage Validation & Adaptive Parameter Bounds
 
-### Summary
-Implemented comprehensive peak tracking improvements based on analysis of real tracking results from `insitu_0.5M_MeOMBAI` dataset. The analysis revealed that ~34% of "successful" fits for weak peaks (MeOMBAI) were actually fitting non-existent peaks (noise/background).
+### Motivation
 
-### Key Changes
+Visual inspection of tracking results from the `insitu_0.5M_MeOMBAI` dataset revealed that ~34% of frames marked as "successful fits" for the MeOMBAI peak were actually fitting noise or background — not a real peak. The symptom was that σ was hitting the parameter ceiling (0.5°) in many frames, which for a diffraction peak about 0.05° wide is physically nonsensical.
 
-#### 1. Two-Stage Validation System
-
-**Stage 1: Pre-Fit Peak Presence Detection** (`check_peak_presence`)
-- **Purpose**: Avoid wasting compute on fitting noise/background
-- **Method**: Signal-to-noise ratio (SNR) analysis before fitting
-- **Implementation**:
-  - Estimates baseline from bottom 10th percentile
-  - Calculates noise from bottom 25th percentile
-  - Computes SNR = (peak_max - baseline) / noise
-  - Configurable threshold via `PeakSpec.min_snr` (default: 3.0)
-- **Output**: (has_peak: bool, reason: str, snr: float)
-- **Status codes**: `peak_absent` if fails
-
-**Stage 2: Post-Fit Quality Validation** (`validate_fit_quality`)
-- **Purpose**: Reject fits where optimizer converged but result is physically meaningless
-- **Checks**:
-  1. **Sigma/gamma at bounds** → Optimizer struggling (tolerance: 5% from bounds)
-  2. **Amplitude ≈ 0** → Fitting noise (threshold: < 1e-4)
-  3. **Peak height too weak** → < 5% of data maximum
-  4. **Poor fit quality** → Reduced chi-square > 20
-- **Output**: (is_valid: bool, reason: str)
-- **Status codes**: `fit_invalid` if fails
-- **Enabled via**: `PeakSpec.validate_fit_quality` (default: True)
-
-#### 2. Adaptive Parameter Bounds
-
-**Motivation**: 
-- Strong, stable peaks (ITO, PbI2) show smooth parameter evolution (σ CV: 5-28%)
-- Current wide bounds waste iterations and allow unrealistic jumps
-- Weak, appearing/disappearing peaks (MeOMBAI) need wide bounds for flexibility
-
-**Implementation**:
-- **Selective enabling**: Per-peak via `PeakSpec.use_adaptive_bounds` (default: False)
-- **Warm-up period**: Requires N consecutive successful fits before activation
-  - Configured via `adaptive_min_consecutive` (default: 5 frames)
-- **Bounds calculation**: Previous value ± tolerance, respecting floor/ceiling
-  - `adaptive_sigma_tolerance`: 50% fractional change allowed (default)
-  - `adaptive_amplitude_tolerance`: 50% fractional change allowed (default)
-- **Parameters tracked**: sigma, gamma, amplitude (in `TrackingState`)
-- **Fallback mechanism**: If validation fails with adaptive bounds, retry with wide bounds
-  - Enabled via `fallback_on_validation_failure` (default: True)
-
-**Modified functions**:
-- `initialize_params()`: New args `previous_params`, `use_adaptive`
-- `fit_frame()`: New args `previous_params`, `use_adaptive`
-- `track_peak_series()`: Logic to decide when to use adaptive bounds
-
-#### 3. Enhanced Tracking State
-
-**TrackingState dataclass** now includes:
-```python
-last_center: float | None
-last_sigma: float | None          # NEW
-last_gamma: float | None           # NEW
-last_amplitude: float | None       # NEW
-tracking_active: bool
-lost_count: int
-consecutive_good_fits: int         # NEW - for adaptive bounds warm-up
-peak_present: bool                 # NEW - distinguish absence vs failure
+**Example (frame 902):**
+```
+fit_success = True
+fit_sigma   = 0.5000  ← at ceiling, optimizer struggled
+fit_amplitude ≈ 0     ← fitting nothing
 ```
 
-#### 4. Enhanced Output Fields
+The root cause was no validation: `lmfit` would converge on a broad, flat fit of the background and report success because no convergence criterion checked for physical plausibility.
 
-**New CSV columns**:
-- `peak_snr`: Signal-to-noise ratio from pre-fit check
-- `peak_presence_check`: "passed" or "failed"
-- `validation_reason`: Why validation failed (if applicable)
-- `used_adaptive_bounds`: Boolean flag
-- `consecutive_good_fits`: Counter for tracking stability
+**Quantitative breakdown of bad fits for MeOMBAI (903 frames):**
+- 143 fits: σ at upper bound (fitting flat background)
+- 136 fits: σ at lower bound (fitting noise spike)
+- 68 fits: amplitude ≈ 0 (no peak present)
+- 4 fits: peak height < 5% of data maximum
 
-**Enhanced `fit_status` values**:
-- `peak_absent`: Peak not present (low SNR)
-- `fit_invalid`: Fit succeeded but validation failed
-- `no_candidate`: No candidate peak found
-- `track`: Normal tracking
-- `search`: Initial search mode
-- `lost`: Generic failure (legacy)
+The same analysis also showed that strong peaks (ITO, PbI2) evolved very smoothly: σ coefficient of variation was 5–28%, meaning tight adaptive bounds could significantly cut optimizer iterations without hurting quality.
 
-#### 5. Updated PeakSpec Configuration
+### What Was Implemented
 
-**New optional parameters**:
+#### Two-Stage Validation
+
+**Stage 1 — Pre-fit SNR check (`check_peak_presence`):**
+Before calling the optimizer, estimate SNR = (peak_max − baseline) / noise, where baseline is the 10th percentile and noise is the std of the lowest 25th percentile. If SNR < `min_snr` (default 3.0), mark frame as `peak_absent` and skip fitting. This is cheap and gives a clean signal for when peaks appear or disappear in the time series.
+
+**Stage 2 — Post-fit quality check (`validate_fit_quality`):**
+After the optimizer converges, reject the result if any of these are true:
+1. σ or γ within 5% of their bounds → optimizer was pinned, result is unphysical.
+2. Amplitude < 1e-4 → fitting essentially nothing.
+3. Peak height < 5% of data maximum → signal too weak relative to background.
+4. Reduced chi-square > 20 → poor fit.
+
+Rejected frames are marked `fit_invalid`; the `validation_reason` CSV column explains which check failed.
+
+#### Adaptive Parameter Bounds
+
+After the validation system was working, adaptive bounds were added to speed up convergence on stable peaks. The idea: once N consecutive fits succeed (warm-up period), constrain σ, γ, and amplitude to ± some tolerance of the previous frame's fitted values instead of resetting to wide bounds every frame.
+
+**Key design decisions:**
+- Off by default (`use_adaptive_bounds = False`). Must be explicitly enabled per-peak.
+- A fallback path retries with wide bounds if validation fails under adaptive constraints.
+- Adaptive state is reset at key frames (user-defined or auto-detected).
+- MeOMBAI and ClMBAI peaks intentionally stay on wide bounds because they genuinely appear and disappear. Tight bounds would prevent reacquisition after absence.
+
+**Code changes:**
+- `TrackingState` gained `last_sigma`, `last_gamma`, `last_amplitude`, `consecutive_good_fits`, `peak_present`.
+- `initialize_params()` and `fit_frame()` gained `previous_params` and `use_adaptive` args.
+- `track_peak_series()` contains the logic deciding when to activate adaptive bounds and when to fall back.
+- `normalize_peak_entries()` updated to parse the new fields from both dict and tuple config formats.
+- `load_config_module()` added to support `--config` CLI argument for different experiment configs.
+
+#### New PeakSpec Parameters
+
 ```python
-# Peak presence validation
-min_snr: float = 3.0                          # Minimum SNR threshold
-validate_fit_quality: bool = True              # Enable post-fit validation
+# Validation
+min_snr: float = 3.0
+validate_fit_quality: bool = True
 
-# Adaptive parameter bounds
-use_adaptive_bounds: bool = False              # Enable selective per-peak
-adaptive_sigma_tolerance: float = 0.5          # 50% allowed change
-adaptive_amplitude_tolerance: float = 0.5      # 50% allowed change
-adaptive_min_consecutive: int = 5              # Warm-up frames required
-fallback_on_validation_failure: bool = True    # Retry with wide bounds
+# Adaptive bounds
+use_adaptive_bounds: bool = False
+adaptive_sigma_tolerance: float = 0.5
+adaptive_amplitude_tolerance: float = 0.5
+adaptive_min_consecutive: int = 5
+fallback_on_validation_failure: bool = True
 ```
 
-### Usage Recommendations
+#### New CSV Columns
 
-**For strong, stable peaks** (ITO, PbI2-like):
-```python
-PeakSpec(
-    name="ITO",
-    # ... other params ...
-    use_adaptive_bounds=True,           # Enable for faster convergence
-    adaptive_min_consecutive=5,          # Start after 5 good fits
-    validate_fit_quality=True,           # Keep validation on
-    min_snr=3.0,                         # Standard SNR check
-)
-```
+`peak_snr`, `peak_presence_check` ("passed"/"failed"), `validation_reason`, `used_adaptive_bounds`, `consecutive_good_fits`.
 
-**For weak/transient peaks** (MeOMBAI-like):
-```python
-PeakSpec(
-    name="MeOMBAI",
-    # ... other params ...
-    use_adaptive_bounds=False,           # Keep wide bounds
-    validate_fit_quality=True,           # Important: catch bad fits
-    min_snr=2.5,                         # Slightly lower threshold
-)
-```
+### Validation Results (10 datasets, Yi-Ru Feb 2026 beamtime)
 
-**For peaks with known discontinuities**:
-```python
-PeakSpec(
-    name="2D_002",
-    # ... other params ...
-    use_adaptive_bounds=True,            # Can use adaptive
-    adaptive_sigma_tolerance=0.7,        # Wider tolerance (70%)
-    key_frames=[0, 100, 200],            # Reset at key frames
-    validate_fit_quality=True,
-)
-```
+| Peak | False positives (before) | False positives (after) | σ std change |
+|------|--------------------------|-------------------------|-------------|
+| MeOMBAI | 34.2% (210/614 fits had σ>0.4) | 0% | 3.3× more stable |
+| ClMBAI | ~33% | ~1% | 3.1× more stable |
+| ITO | 0% (already clean) | 0% | unchanged; +30-40% faster |
+| PbI2 | 0.3% | 10.1% → fixed in v2 | — |
+| 2D (002) | 0.7% | 0% | 5.4× more stable |
 
-### Impact on Existing Results
+**PbI2 v2 fix:** The first validated config accepted PbI2 fits with σ up to 0.45–0.48° when the physical expectation is σ ≈ 0.05–0.10°. The root cause was sigma_ceiling = `max(window_deg, drift_tolerance_deg × 4) = 0.5°`, which was too lenient. Fixed by moving the tighter ceiling into the config (sigma_max = 0.15° for PbI2), which eliminated the false positives in the two worst MBAI datasets.
 
-**Backward compatibility**: 
-- All new features are opt-in (disabled by default except validation)
-- Existing configurations will run with validation enabled but no adaptive bounds
-- Output CSV gains new columns but retains all existing ones
-
-**Expected improvements**:
-1. **Fewer false positives**: Validation will reject ~34% of bad MeOMBAI fits
-2. **Faster convergence**: Adaptive bounds reduce iterations for stable peaks
-3. **Better diagnostics**: Clear distinction between "peak absent" and "fit failed"
-4. **Smarter tracking**: Parameters propagate frame-to-frame when appropriate
-
-### Testing & Validation
-
-**Recommended workflow**:
-1. Run on existing dataset without adaptive bounds (validation only)
-2. Compare `peak_absent` counts - should match physical expectations
-3. Check `fit_invalid` cases manually via fit_plots
-4. Enable adaptive bounds for stable peaks only
-5. Monitor `used_adaptive_bounds` and `consecutive_good_fits` in CSV
-
-### References
-
-- Analysis document: `TRACKING_ANALYSIS_FINDINGS.md`
-- Analysis scripts: `analyze_tracking.py`, `check_bounds.py`
-- Test dataset: `G:\...\insitu_0.5M_MeOMBAI_20260526_001029\`
-
-### Implementation Status
-
-✅ **COMPLETE** (2026-05-26)
-
-**Code Changes**:
-- `peak_tracking_workflow.py` - All functions updated, type-safe, backward compatible
-  - Modified `normalize_peak_entries()` to parse new validation/adaptive parameters from configs (both dict and tuple formats)
-  - Added `load_config_module()` function for dynamic config loading
-  - Made config file path a CLI argument (--config)
-  - Updated all functions to accept `run_configs` and `default_output_root` as parameters
-- Type checking: ✅ PASSED (one harmless joblib warning)
-
-**CLI Changes**:
-- New `--config` argument to specify config file path (defaults to peak_tracking_config.py in same directory)
-- Example usage: `python peak_tracking_workflow.py --config my_config.py --run insitu_0.5M_MeOMBAI`
-
-**Documentation Created**:
-1. `PEAK_VALIDATION_GUIDE.md` - User-facing guide with examples and troubleshooting
-2. `QUICK_REFERENCE.md` - Configuration cheat sheet and decision flowcharts
-3. `IMPLEMENTATION_SUMMARY.md` - Technical implementation checklist
-4. `TRACKING_ANALYSIS_FINDINGS.md` - Data analysis that motivated changes
-5. `CONFIGURATION_EXAMPLES.md` - Complete examples with decision trees
-6. `peak_tracking_config_EXAMPLE_VALIDATION.py` - Examples using existing tuple format
-
-**Configuration Update**:
-- ✅ Updated `normalize_peak_entries()` to parse new fields from both dict and tuple configs
-- ✅ All new parameters work with existing tuple format: `(center, window, frame_range, name, extras_dict)`
-- ✅ Backward compatible - existing configs work unchanged (defaults applied automatically)
-- ✅ Config file can now be specified via CLI for different experiments
-
-**Results Comparison** (2026-05-26):
-
-Completed batch runs comparing original vs validated configs on all 10 datasets. Detailed analysis:
-
-| Metric | Original | Validated | Improvement |
-|--------|----------|-----------|-------------|
-| **MeOMBAI False Positive Rate** | 34.2% (210/614 fits had σ>0.4) | 0% | **Eliminated all bad fits** |
-| **MeOMBAI σ Stability** | std=0.214, max=0.500 | std=0.065, max=0.392 | **3.3x less variation, no bound hits** |
-| **ITO Adaptive Bounds Usage** | 0% | 98.9% (893/903 frames) | **30-40% faster convergence** |
-| **PbI2 Adaptive Bounds Usage** | 0% | 75.6% (683/903 frames) | **20-30% faster when active** |
-| **2D (002) False Positives** | 6/883 (0.7%) with σ>0.4 | 0/842 (0%) | **Removed 6 outliers** |
-| **2D (002) σ Stability** | std=0.049 | std=0.009 | **5.4x more stable** |
-
-**Key Validation Reasons** (MeOMBAI, 648 rejections total):
-- **136 (15.1%)**: Sigma at lower bound (σ ≈ 0.01) — fitting noise spikes
-- **~143 (15.8%)**: Sigma at upper bound (σ ≥ 0.475) — fitting flat background, the major false positive problem
-- **68 (7.5%)**: Amplitude near zero (A ≈ 1e-6) — no peak present
-- **~4 (0.4%)**: Peak too weak (height < 5% data_max) — insignificant signal
-
-**Physical Interpretation**:
-- Original config: 614/903 (68%) "successful" fits for MeOMBAI
-- Validated config: 255/903 (28.2%) genuine peaks
-- **Difference**: 359 frames (39.8%) were false positives — optimizer was fitting noise and background as if they were real peaks
-- The validated config correctly identifies these as `lost` (peak absent or fit invalid), not success
-
-**Impact by Peak Type**:
-1. **MeOMBAI (weak, intermittent)**: Critical improvement — eliminated 34% false positive rate
-2. **ITO (strong substrate)**: No quality loss (99.9% vs 100%), 30-40% faster with adaptive bounds
-3. **PbI2 (reaction product)**: Better detection (84.8% vs 100%) — original was claiming unrealistic 100% success
-4. **2D (002) (strong perovskite)**: Removed 6 outliers, 5.4x more stable σ, adaptive bounds active
-
-**Documentation Created**:
-- `RESULTS_COMPARISON.md` - Detailed results analysis with metrics and recommendations
-- `VALIDATION_ANALYSIS.md` - Physical interpretation of rejection reasons and examples
+**Backward compatibility:** All new parameters default to values that preserve the old behavior (except `validate_fit_quality = True` by default). Existing configs work unchanged; they just gain the five new CSV columns.
 - `CONFIG_VALIDATED_README.md` - Guide for using optimized validated config
 - `compare_results.py` - Automated comparison script
 - `visual_comparison_guide.py` - Guide for visual inspection of fit plots

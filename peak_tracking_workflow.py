@@ -1,3 +1,23 @@
+"""Peak tracking and integration workflow for GIWAXS time series.
+
+This module provides a config-driven pipeline that, for each peak in a
+NetCDF time series:
+
+1. Searches a 2θ window around the last known peak center.
+2. Performs a pre-fit SNR check to detect peak absence without fitting.
+3. Fits an lmfit model (Voigt + background by default).
+4. Validates fit quality to reject optimizer-converged-but-unphysical results.
+5. Integrates raw area, background area, and net area over the fitted peak width.
+6. Exports CSV tables and summary plots, saving fit PNGs for key frames.
+
+Entry point::
+
+    uv run python peak_tracking_workflow.py --run <preset_name>
+    uv run python peak_tracking_workflow.py --run-all --jobs 4
+    uv run python peak_tracking_workflow.py --list-runs
+
+See PEAK_TRACKING_GUIDE.md for full user documentation.
+"""
 from __future__ import annotations
 
 import argparse
@@ -61,6 +81,21 @@ def load_config_module(config_path: Path) -> tuple[Path, dict[str, Any]]:
 
 @dataclass(frozen=True)
 class FitterSpec:
+    """Specification for the lmfit model used to fit a single peak.
+
+    Attributes:
+        kind: Predefined model name. One of: ``voigt_linear``, ``voigt_constant``,
+            ``voigt_exp``, ``gaussian_linear``, ``pseudo_voigt_linear``,
+            ``double_voigt_linear``, ``voigt``. Default ``voigt_linear``.
+        factory: Optional callable or ``"module:function"`` string for a custom
+            model factory. The factory must accept ``peak_spec`` as a keyword
+            argument and return a :class:`FitBundle`.
+        kwargs: Extra keyword arguments forwarded to the factory.
+        fit_half_width_deg: If set, restricts the fitting window to this
+            half-width around the candidate center. Useful when a sharp peak
+            sits inside a wider integration window so that the fit is not
+            influenced by distant background features.
+    """
     kind: str = "voigt_linear"
     factory: str | Callable[..., Any] | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
@@ -69,6 +104,74 @@ class FitterSpec:
 
 @dataclass(frozen=True)
 class PeakSpec:
+    """Complete specification for tracking and fitting one peak in a time series.
+
+    All angular values are in degrees (2θ).
+
+    Core localization:
+        name: Human-readable peak label used in CSV output and plot titles.
+        center_deg: Expected 2θ position; used as the initial search anchor and
+            for key-frame resets.
+        window_deg: Half-width of the candidate search window. Should be wide
+            enough to contain the peak plus a small margin, but not so wide that
+            a neighboring peak falls inside.
+        start_idx / stop_idx: Inclusive frame range (negative = from end).
+        drift_tolerance_deg: Maximum allowed shift of the fitted center from the
+            candidate center. Also sets the bounds on the ``peak_center``
+            parameter during fitting. Tight for substrate peaks (0.05°), wider
+            for drifting perovskite peaks (0.10–0.15°).
+        reacquire_window_deg: Expanded search half-width during reacquisition
+            after a lost frame (defaults to ``drift_tolerance_deg × 3``).
+        frame_step: Process every N-th frame (default 1 = every frame).
+
+    Key frames:
+        key_frames: Tuple of frame indices at which to force-reset tracking to
+            ``center_deg``. A fit PNG is always saved at these frames.
+        key_frames_mode: ``"additive"`` (default) processes all frames and also
+            resets at key frames. ``"restrict"`` processes only key frames.
+        auto_keyframe_every: Auto-reset tracking and save a fit PNG every N
+            consecutive successfully tracked frames (default 15).
+
+    Integration:
+        integration_height: Fractional peak height at which to measure the Voigt
+            width for setting integration bounds (default 0.25, i.e. roughly the
+            quarter-maximum width).
+        integration_multiplier: Multiplier applied to the measured width
+            (default 2.0) to ensure the full peak area is captured.
+        max_integration_span_deg: Hard cap on integration width in degrees
+            (default 3.0°).
+        min_prominence: Minimum prominence required for ``scipy.signal.find_peaks``
+            to accept a candidate (default 0.0 = no filter).
+        peak_only_window_deg: If set, restricts the fitting window to this
+            half-width regardless of ``fitter.fit_half_width_deg``.
+
+    Model:
+        fitter: :class:`FitterSpec` controlling the lmfit model.
+        baseline_method: Optional ``pybaselines`` method name applied per-frame
+            before fitting (e.g. ``"snip"``, ``"aspls"``).
+        baseline_kwargs: Extra keyword arguments forwarded to the baseline method.
+
+    Validation:
+        min_snr: Minimum signal-to-noise ratio for the pre-fit peak presence
+            check. Frames below this threshold are marked ``peak_absent`` and
+            skipped. Lower for weak peaks (2.0–2.5), higher for strong (4.0–5.0).
+        validate_fit_quality: When True (default), apply post-fit quality checks
+            that reject fits where the optimizer hit bounds, amplitude is near
+            zero, the peak is too weak, or reduced chi-square > 20.
+
+    Adaptive bounds (optional, disabled by default):
+        use_adaptive_bounds: Constrain σ/γ/amplitude to ± tolerance of the
+            previous frame's values after a warm-up period. Enable for strong,
+            always-present peaks; disable for weak/intermittent peaks.
+        adaptive_sigma_tolerance: Allowed fractional change in σ and γ (default
+            0.5 = ±50%).
+        adaptive_amplitude_tolerance: Allowed fractional change in amplitude
+            (default 0.5 = ±50%).
+        adaptive_min_consecutive: Number of consecutive successful fits required
+            before adaptive bounds activate (default 5).
+        fallback_on_validation_failure: If True (default), retry with wide bounds
+            when validation fails under adaptive constraints.
+    """
     name: str
     center_deg: float
     window_deg: float
@@ -101,6 +204,24 @@ class PeakSpec:
 
 @dataclass(frozen=True)
 class RunConfig:
+    """Complete configuration for one tracking run.
+
+    Attributes:
+        name: Run identifier used in output folder names and CSV ``run_name`` column.
+        da_file: Path to the NetCDF ``.nc`` file. Must contain a ``time`` dimension
+            and either a ``twoTheta_deg`` or ``q_A^-1`` coordinate.
+        peaks: List of :class:`PeakSpec` objects; one entry per peak to track.
+        global_shift_deg: Fixed 2θ offset applied to every frame before any
+            processing. Use to correct a miscalibrated poni file.
+        output_root: Root directory for timestamped output folders.
+        baseline_method: Run-level baseline method applied to all peaks unless
+            overridden by an individual :class:`PeakSpec`.
+        baseline_kwargs: Run-level baseline kwargs.
+        wavelength_a: X-ray wavelength in Ångströms used for q→2θ conversion
+            (default Cu Kα = 1.5418 Å).
+        keyframe_plot_margin_deg: Plot window half-width (in 2θ) around the
+            integration region in key-frame fit PNGs (default 5.0°).
+    """
     name: str
     da_file: Path
     peaks: list[PeakSpec]
@@ -114,6 +235,15 @@ class RunConfig:
 
 @dataclass
 class FitBundle:
+    """Container pairing an lmfit composite model with metadata.
+
+    Attributes:
+        model: The composite lmfit Model (e.g. VoigtModel + LinearModel).
+        fit_kind: The ``FitterSpec.kind`` string used to build this model.
+        component_names: Tuple of model component prefixes (e.g.
+            ``("peak_", "bkg_")``). Used to separate peak from background when
+            computing net area.
+    """
     model: Model
     fit_kind: str
     component_names: tuple[str, ...] = ()
@@ -121,6 +251,24 @@ class FitBundle:
 
 @dataclass
 class TrackingState:
+    """Mutable state carried frame-to-frame during peak tracking.
+
+    Attributes:
+        last_center: Fitted 2θ center from the previous successful frame.
+            Used as the search anchor for the next frame.
+        last_sigma: Fitted σ from the previous successful frame; used for
+            adaptive bounds.
+        last_gamma: Fitted γ from the previous successful frame; used for
+            adaptive bounds.
+        last_amplitude: Fitted amplitude from the previous successful frame;
+            used for adaptive bounds.
+        tracking_active: True once the first successful fit has been obtained.
+        lost_count: Number of consecutive frames without a successful fit.
+        consecutive_good_fits: Consecutive successful fits since last loss or
+            key-frame reset. Counts toward the adaptive bounds warm-up.
+        peak_present: Whether the peak was physically present in the last
+            processed frame (as opposed to a fit failure on a present peak).
+    """
     last_center: float | None = None
     last_sigma: float | None = None
     last_gamma: float | None = None
@@ -132,6 +280,7 @@ class TrackingState:
 
 
 def configure_logging(run_dir: Path) -> None:
+    """Set up root logger to write to both console and a log file in *run_dir*."""
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "peak_tracking.log"
     handlers = [logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")]
@@ -145,6 +294,7 @@ def configure_logging(run_dir: Path) -> None:
 
 
 def _as_dataarray(data: xr.Dataset | xr.DataArray) -> xr.DataArray:
+    """Extract an intensity DataArray from a Dataset, trying common variable names."""
     if isinstance(data, xr.DataArray):
         return data
 
@@ -159,6 +309,18 @@ def _as_dataarray(data: xr.Dataset | xr.DataArray) -> xr.DataArray:
 
 
 def load_time_series(da_file: Path, wavelength_a: float = DEFAULT_WAVELENGTH_A) -> xr.DataArray:
+    """Load a NetCDF time series and ensure it has ``twoTheta_deg`` and ``time`` dimensions.
+
+    If the file has a ``q_A^-1`` coordinate instead of ``twoTheta_deg``, it is
+    converted using Bragg's law: 2θ = 2 arcsin(q λ / 4π).
+
+    Args:
+        da_file: Path to a NetCDF file (.nc).
+        wavelength_a: X-ray wavelength in Ångströms for q→2θ conversion.
+
+    Returns:
+        DataArray sorted by time and 2θ.
+    """
     if not da_file.is_file():
         raise FileNotFoundError(f"NetCDF file not found: {da_file}")
 
@@ -183,12 +345,29 @@ def load_time_series(da_file: Path, wavelength_a: float = DEFAULT_WAVELENGTH_A) 
 
 
 def apply_global_shift(data: xr.DataArray, shift_deg: float) -> xr.DataArray:
+    """Shift the ``twoTheta_deg`` coordinate of *data* by *shift_deg* degrees.
+
+    Used to correct a systematic 2θ offset from a miscalibrated poni file.
+    A no-op when *shift_deg* is 0.
+    """
     if shift_deg == 0:
         return data
     return data.assign_coords(twoTheta_deg=data.twoTheta_deg + shift_deg)
 
 
 def baseline_correct_frame(frame: xr.DataArray, method: str | None, **kwargs: Any) -> tuple[xr.DataArray, xr.DataArray | None]:
+    """Apply a ``pybaselines`` baseline correction to a single frame.
+
+    Args:
+        frame: 1-D intensity DataArray for one time step.
+        method: Name of a ``pybaselines.Baseline`` method (e.g. ``"snip"``).
+            ``None`` skips correction.
+        **kwargs: Forwarded to the baseline method.
+
+    Returns:
+        Tuple of (baseline-corrected frame, baseline DataArray). The baseline
+        DataArray is ``None`` when no correction is applied.
+    """
     if not method:
         return frame, None
 
@@ -203,6 +382,18 @@ def baseline_correct_frame(frame: xr.DataArray, method: str | None, **kwargs: An
 
 
 def normalize_peak_entries(entries: Iterable[Any]) -> list[PeakSpec]:
+    """Convert a mixed list of peak definitions into a uniform list of :class:`PeakSpec`.
+
+    Accepts three input formats per entry:
+
+    * A :class:`PeakSpec` instance (passed through unchanged).
+    * A ``dict`` with keys matching :class:`PeakSpec` field names.
+    * A tuple/list ``(center_deg, window_deg, (start_idx, stop_idx), name)``
+      or ``(center_deg, window_deg, (start_idx, stop_idx), name, extras_dict)``
+      where *extras_dict* holds optional PeakSpec fields.
+
+    All missing optional fields receive their :class:`PeakSpec` defaults.
+    """
     normalized: list[PeakSpec] = []
     for entry in entries:
         if isinstance(entry, PeakSpec):
@@ -319,6 +510,11 @@ def normalize_run_config(name: str, config: dict[str, Any], default_output_root:
 
 
 def inclusive_frame_indices(start_idx: int, stop_idx: int, size: int) -> list[int]:
+    """Return an inclusive list of frame indices between *start_idx* and *stop_idx*.
+
+    Supports negative indices (Python-style, from end of series). The direction
+    of the returned list follows the sign of ``stop_idx - start_idx``.
+    """
     start = start_idx if start_idx >= 0 else size + start_idx
     stop = stop_idx if stop_idx >= 0 else size + stop_idx
     if start < 0 or start >= size or stop < 0 or stop >= size:
@@ -328,6 +524,7 @@ def inclusive_frame_indices(start_idx: int, stop_idx: int, size: int) -> list[in
 
 
 def local_window(data: xr.DataArray, center: float, half_width: float) -> xr.DataArray:
+    """Slice *data* to the 2θ interval [center − half_width, center + half_width]."""
     return data.sel(twoTheta_deg=slice(center - half_width, center + half_width))
 
 
@@ -336,6 +533,22 @@ def choose_candidate(
     center_guess: float,
     min_prominence: float = 0.0,
 ) -> dict[str, float] | None:
+    """Find the most plausible peak candidate within *window_data*.
+
+    Applies a rolling-mean smooth then uses ``scipy.signal.find_peaks`` to
+    locate peaks. Ranks candidates by a score that favours proximity to
+    *center_guess* and high prominence. Returns the best candidate or ``None``
+    if no peaks are found.
+
+    Args:
+        window_data: 1-D DataArray slice to search.
+        center_guess: Expected 2θ position used for proximity scoring.
+        min_prominence: Minimum peak prominence passed to ``find_peaks``.
+
+    Returns:
+        Dict with ``center``, ``intensity``, and ``prominence`` keys, or
+        ``None`` if no candidate was found.
+    """
     x_vals = window_data.twoTheta_deg.values
     y_vals = window_data.values
     finite_mask = np.isfinite(y_vals)
@@ -467,6 +680,7 @@ def validate_fit_quality(
 
 
 def _linear_background_guess(x_vals: np.ndarray, y_vals: np.ndarray) -> tuple[float, float]:
+    """Return (slope, intercept) of a linear fit to (x_vals, y_vals)."""
     if len(x_vals) < 2:
         return 0.0, float(np.nanmedian(y_vals) if len(y_vals) else 0.0)
     slope, intercept = np.polyfit(x_vals, y_vals, 1)
@@ -474,11 +688,25 @@ def _linear_background_guess(x_vals: np.ndarray, y_vals: np.ndarray) -> tuple[fl
 
 
 def _exp_background(x: np.ndarray, amplitude: float, decay: float) -> np.ndarray:
+    """Exponential background model: amplitude * exp(decay * (x - x0))."""
     x0 = float(np.nanmin(x)) if np.size(x) else 0.0
     return amplitude * np.exp(decay * (x - x0))
 
 
 def build_model_bundle(peak_spec: PeakSpec) -> FitBundle:
+    """Build the lmfit composite model described by *peak_spec.fitter*.
+
+    For built-in kinds the model is composed from lmfit primitives. For custom
+    kinds, ``fitter.factory`` is called with ``peak_spec`` as a keyword argument
+    and must return a :class:`FitBundle`.
+
+    Returns:
+        :class:`FitBundle` with the model, kind string, and component prefixes.
+
+    Raises:
+        ValueError: If ``fitter.kind`` is not recognised.
+        TypeError: If a custom factory returns the wrong type.
+    """
     fitter = peak_spec.fitter
 
     if fitter.factory is not None:
@@ -724,6 +952,13 @@ def fit_frame(
 
 
 def summarize_fit_quality(fit_res: Any) -> dict[str, float]:
+    """Compute fit quality metrics from an lmfit ModelResult.
+
+    Returns a dict with keys: ``fit_chisqr``, ``fit_redchi``, ``fit_rmse``,
+    ``fit_rel_rmse``, ``fit_r2``, ``fit_quality_score``.
+
+    ``fit_quality_score`` = 1 / (1 + rel_rmse), ranging from 0 (bad) to 1 (perfect).
+    """
     data = np.asarray(fit_res.data, dtype=float)
     residual = np.asarray(fit_res.residual, dtype=float)
     ss_res = float(np.nansum(residual**2))
@@ -745,12 +980,27 @@ def summarize_fit_quality(fit_res: Any) -> dict[str, float]:
 
 
 def integrate_interval(frame: xr.DataArray, left: float, right: float, num_points: int = 256) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate *frame* onto a uniform grid over [left, right] for numerical integration."""
     grid = np.linspace(left, right, num_points)
     values = frame.interp(twoTheta_deg=grid).values
     return grid, values
 
 
 def integrate_peak(frame: xr.DataArray, fit_info: dict[str, Any]) -> dict[str, Any]:
+    """Compute raw area, background area, and net area for a fitted peak.
+
+    Integration bounds are taken from *fit_info* (set by :func:`fit_frame`) and
+    clamped to the data range. Background area is the trapezoid integral of all
+    non-``peak_`` model components. Net area = raw area − background area.
+
+    Args:
+        frame: Baseline-corrected 1-D frame DataArray.
+        fit_info: Output dict from :func:`fit_frame`.
+
+    Returns:
+        Dict with ``raw_area``, ``background_area``, ``net_area``,
+        ``integration_left``, ``integration_right``.
+    """
     left = float(max(fit_info["integration_left"], float(frame.twoTheta_deg.min())))
     right = float(min(fit_info["integration_right"], float(frame.twoTheta_deg.max())))
     if not math.isfinite(left) or not math.isfinite(right) or left >= right:
@@ -774,6 +1024,13 @@ def integrate_peak(frame: xr.DataArray, fit_info: dict[str, Any]) -> dict[str, A
 
 
 def frame_indices_for_peak(peak_spec: PeakSpec, size: int) -> list[int]:
+    """Compute the ordered list of frame indices to process for *peak_spec*.
+
+    Handles negative indices, ``frame_step``, and ``key_frames_mode``.
+    In ``"restrict"`` mode only the configured key frames are processed.
+    In ``"additive"`` mode (default) the full range is returned; key frames
+    only control tracking resets, not which frames are visited.
+    """
     start = peak_spec.start_idx if peak_spec.start_idx >= 0 else size + peak_spec.start_idx
     stop = peak_spec.stop_idx if peak_spec.stop_idx >= 0 else size + peak_spec.stop_idx
     if start < 0 or stop < 0 or start >= size or stop >= size:
@@ -885,6 +1142,30 @@ def _save_failed_fit_plot(run_dir: Path, frame: xr.DataArray, candidate_center: 
 
 
 def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, global_shift_deg: float = 0.0, keyframe_plot_margin_deg: float = 5.0) -> list[dict[str, Any]]:
+    """Track and fit one peak across all frames in *series*.
+
+    Implements the full frame-by-frame loop:
+    baseline correction → SNR check → candidate search → fitting
+    (with optional adaptive bounds) → post-fit validation → integration
+    → row assembly.
+
+    Key-frame resets (user-configured and auto-detected) cause the search
+    anchor to revert to ``peak_spec.center_deg`` and reset ``TrackingState``.
+    Fit PNGs are saved to ``run_dir/fit_plots/`` for every key frame.
+
+    Args:
+        series: Full 2-D (time × twoTheta_deg) DataArray for one run.
+        peak_spec: Specification for this peak.
+        run_dir: Output directory for log and fit plots.
+        global_shift_deg: 2θ offset already applied to *series* (recorded in
+            CSV for traceability).
+        keyframe_plot_margin_deg: Plot window half-width around the integration
+            region in key-frame PNGs.
+
+    Returns:
+        List of row dicts, one per processed frame. Columns match the long CSV
+        schema described in PEAK_TRACKING_GUIDE.md.
+    """
     times = series.time.values
     frames = frame_indices_for_peak(peak_spec, len(times))
     state = TrackingState(
@@ -1184,6 +1465,12 @@ def track_peak_series(series: xr.DataArray, peak_spec: PeakSpec, run_dir: Path, 
 
 
 def postprocess_normalization(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``normalized_raw_area`` and ``normalized_net_area`` columns to *df*.
+
+    Each peak is normalized independently to its own maximum net/raw area
+    across all frames. Rows with NaN or infinite areas are excluded from the
+    normalization denominator.
+    """
     df = df.copy()
     df["normalized_raw_area"] = np.nan
     df["normalized_net_area"] = np.nan
@@ -1200,6 +1487,13 @@ def postprocess_normalization(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_outputs(run_dir: Path, df_long: pd.DataFrame, config: RunConfig) -> None:
+    """Write CSVs and run config JSON to *run_dir*.
+
+    Writes:
+    - ``tracking_results_long.csv``: all columns, all frames.
+    - ``tracking_results_compact.csv``: subset of most-useful columns.
+    - ``run_config.json``: serialised :class:`RunConfig` for reproducibility.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     df_long.to_csv(run_dir / "tracking_results_long.csv", index=False)
     compact_cols = [
@@ -1241,6 +1535,14 @@ def save_outputs(run_dir: Path, df_long: pd.DataFrame, config: RunConfig) -> Non
 
 
 def plot_results(run_dir: Path, df: pd.DataFrame) -> None:
+    """Save summary plots to *run_dir*.
+
+    Generates:
+    - ``summary_peak_traces.png``: net area and normalised net area per peak
+      on separate subplots.
+    - ``summary_normalized_overlay.png``: all peak normalised net areas
+      overlaid on one plot.
+    """
     peaks = list(pd.unique(df["peak_name"]))
     if not peaks:
         return
@@ -1277,6 +1579,17 @@ def plot_results(run_dir: Path, df: pd.DataFrame) -> None:
 
 
 def run_peak_tracking(config: RunConfig) -> tuple[pd.DataFrame, Path]:
+    """Execute a complete tracking run for all peaks defined in *config*.
+
+    Creates a timestamped output directory, loads the time series, tracks each
+    peak, normalises areas, saves outputs, and generates summary plots.
+
+    Args:
+        config: :class:`RunConfig` describing the data file and all peaks.
+
+    Returns:
+        Tuple of (results DataFrame, run output directory path).
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = config.output_root / f"{config.name}_{timestamp}"
     configure_logging(run_dir)
